@@ -95,12 +95,20 @@ export interface GaslessShieldInput {
 /**
  * Assemble a gasless shield: the two shield requests (user note + relayer fee note), their bound
  * `requestsHash`, and the EIP-712 typed data to sign. The caller signs `typedData` (the intent) and a
- * separate EIP-2612 permit, then submits `gaslessShield(params, intentSig, shieldRequests)` via the relayer.
+ * separate EIP-2612 permit, then submits `gaslessShield(params, intentSig, shieldRequests)` via the relayer
+ * (`buildGaslessShieldCalldata`). Each note's `random` is returned too: the relayer needs `feeRandom` to
+ * rebuild its fee note's npk and verify it (`verifyShieldFeeNote`).
  */
 export async function buildGaslessShield(
   input: GaslessShieldInput,
   shieldPrivateKey: Uint8Array,
-): Promise<{ shieldRequests: ShieldRequest[]; requestsHash: `0x${string}`; typedData: ShieldIntentTypedData }> {
+): Promise<{
+  shieldRequests: ShieldRequest[];
+  requestsHash: `0x${string}`;
+  typedData: ShieldIntentTypedData;
+  userRandom: string;
+  feeRandom: string;
+}> {
   const userNote = await buildShieldRequest(input.userShield, shieldPrivateKey);
   // Gross up the fee note so the relayer nets `amount` AFTER the pool's shield fee (§4.6.1); if no tiers
   // are given, `amount` is used verbatim as the gross note value.
@@ -118,7 +126,7 @@ export async function buildGaslessShield(
     chainId: input.chainId,
     intent: { user: input.user, requestsHash, integrator: input.integrator, deadline: input.deadline, nonce: input.nonce },
   });
-  return { shieldRequests, requestsHash, typedData };
+  return { shieldRequests, requestsHash, typedData, userRandom: userNote.random, feeRandom: feeNote.random };
 }
 
 /** EIP-2612 permit message the user signs so the wrapper can pull USDC gaslessly (owner→spender allowance). */

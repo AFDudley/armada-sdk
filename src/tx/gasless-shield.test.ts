@@ -8,6 +8,7 @@ import { tryDecryptShield } from '../sync/shield-crypto';
 import type { DecodedShieldCommitment } from '../sync/index';
 import { generateShieldPrivateKey, type ShieldRequest } from './shield';
 import { hashShieldRequests, buildShieldIntentTypedData, hashShieldIntent, buildGaslessShield } from './gasless-shield';
+import { reconstructShieldNpk, verifyShieldFeeNote } from './shield-fee';
 
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const z = (prefix: string): string => `0x${prefix}${'00'.repeat(31)}`;
@@ -91,5 +92,28 @@ describe('gasless shield (§4.6, #410)', () => {
     });
     expect(owned?.value).toBe(feeAmount);
     expect(owned?.tokenHash).toBe(getTokenDataHash(getTokenDataERC20(USDC)));
+  });
+
+  it('returns both note randoms, so the relayer can verify its fee note by rebuilding the npk (#115)', async () => {
+    // WHY: relayer-v2's gasless fee verifier rebuilds the fee note's npk from `feeShieldRandom`. The builder used
+    // to discard the randoms, so a gasless shield built with it was rejected by the relayer.
+    const user: Keyset = await deriveKeyset(seed(0x11));
+    const relayer: Keyset = await deriveKeyset(seed(0x22));
+    const { shieldRequests, userRandom, feeRandom } = await buildGaslessShield(
+      {
+        wrapperAddress: '0x00000000000000000000000000000000000000aa',
+        chainId: 31337,
+        user: '0x00000000000000000000000000000000deadbeef',
+        integrator: '0x0000000000000000000000000000000000000000',
+        deadline: 2000n,
+        nonce: 3n,
+        userShield: { shieldedAddress: user.shieldedAddress, amount: 10_000_000n, tokenAddress: USDC },
+        feeShield: { shieldedAddress: relayer.shieldedAddress, amount: 50_000n, tokenAddress: USDC },
+      },
+      generateShieldPrivateKey(),
+    );
+    expect(verifyShieldFeeNote({ shieldRequests, broadcasterMasterPublicKey: relayer.masterPublicKey, random: feeRandom, minValue: 50_000n }))
+      .toEqual({ value: 50_000n });
+    expect(BigInt(shieldRequests[0]!.preimage.npk)).toBe(reconstructShieldNpk(user.masterPublicKey, userRandom));
   });
 });

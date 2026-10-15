@@ -194,20 +194,31 @@ export interface TransactDecoder {
 // Native transact()/wrapper calldata decoder + in-band fee-note recovery (the TransactDecoder methods).
 export { decodeTransact, extractFeeOutput, TRANSACT_ABI, TRANSACTION_STRUCT } from './decode';
 
-// Wrapper calldata builders — embed a proved Transaction into the yield / cross-chain-unshield entry points.
+// Wrapper calldata — embed a proved Transaction into the yield / cross-chain-unshield entry points, and encode/decode
+// the gasless shield calls (#410).
 export {
   buildAtomicCrossChainUnshieldCalldata,
   buildLendAndShieldCalldata,
   buildRedeemAndShieldCalldata,
+  buildGaslessShieldCalldata,
+  decodeGaslessShieldCalldata,
+  buildGaslessCrossChainShieldCalldata,
+  decodeGaslessCrossChainShieldCalldata,
 } from './wrappers';
-export type { ShieldCiphertextArg } from './wrappers';
+export type { ShieldCiphertextArg, GaslessShieldParams, GaslessCrossChainShieldParams } from './wrappers';
 
 // Shield fee gross-up + npk-reconstruction fee verification (§4.6.1/#410).
 export { shieldFee, shieldNet, grossUpShieldFee, reconstructShieldNpk, verifyShieldFeeNote } from './shield-fee';
 export type { ShieldFeeTiers } from './shield-fee';
 
 // Gasless cross-chain shield — the two ShieldData notes + EIP-712 CrossChainShieldIntent (#410).
-export { buildGaslessCrossChainShield, hashShieldData, hashCrossChainShieldIntent } from './gasless-cross-chain-shield';
+export {
+  buildGaslessCrossChainShield,
+  hashShieldData,
+  hashCrossChainShieldIntent,
+  buildCrossChainShieldIntentTypedData,
+  shieldDataFromRequest,
+} from './gasless-cross-chain-shield';
 export type { ShieldData, CrossChainShieldIntent, CrossChainShieldIntentTypedData, GaslessCrossChainShieldInput } from './gasless-cross-chain-shield';
 
 // transact() calldata serializer (inverse of decodeTransact) — proof G2 swap + Transaction structs.

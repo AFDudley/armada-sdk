@@ -601,7 +601,14 @@ const tx = buildTransactCalldata(handles.map((h) => h.toTransactionData()), pool
     note, integrator), enabling any-relayer submission with nothing alterable in transit;
   - the **permit-based gasless path** (token permit + intent, no user gas);
   - the **cross-chain variant** — fee note carried across CCTP and minted on the hub, with
-    the multi-note mint batched into a single `Shield` event.
+    the multi-note mint batched into a single `Shield` event;
+  - **what a consumer needs end to end** (#115):
+    - the builders return each note's `random`, which the relayer needs to rebuild its fee note's npk
+      (`verifyShieldFeeNote` / `reconstructShieldNpk`);
+    - `buildGaslessShieldCalldata` / `buildGaslessCrossChainShieldCalldata` encode the wrapper calls, and
+      `decodeGaslessShieldCalldata` / `decodeGaslessCrossChainShieldCalldata` let the relayer read them back;
+    - staged pieces (`buildShieldRequest`, `shieldDataFromRequest`, `buildShieldIntentTypedData`,
+      `buildCrossChainShieldIntentTypedData`) support a save-and-resume signing flow.
 
 #### 4.6.1 Fee binding
 

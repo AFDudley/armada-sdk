@@ -2,12 +2,20 @@
 // ABOUTME: wrapper-aware decodeTransact round-trips back, and the selectors match the deployed contracts.
 
 import { describe, it, expect } from 'vitest';
-import { ZeroAddress } from 'ethers';
+import { Interface, ZeroAddress } from 'ethers';
 import {
   buildAtomicCrossChainUnshieldCalldata,
   buildLendAndShieldCalldata,
   buildRedeemAndShieldCalldata,
+  buildGaslessShieldCalldata,
+  decodeGaslessShieldCalldata,
+  buildGaslessCrossChainShieldCalldata,
+  decodeGaslessCrossChainShieldCalldata,
 } from './wrappers';
+import { hashShieldRequests } from './gasless-shield';
+import { hashShieldData, type ShieldData } from './gasless-cross-chain-shield';
+import type { ShieldRequest } from './shield';
+import { InvalidRequestError } from '../errors';
 import { decodeTransact } from './decode';
 import type { TransactionData } from './serialize';
 import type { CommitmentCiphertextV2 } from '../sync/index';
@@ -71,5 +79,103 @@ describe('wrapper calldata builders (§4.6)', () => {
 
   it('decodeTransact throws on an unrecognized selector', () => {
     expect(() => decodeTransact('0xdeadbeef')).toThrow(/unrecognized selector/);
+  });
+});
+
+// The gasless wrapper ABIs exactly as armada-interface encodes them against the deployed GaslessShieldWrapper /
+// GaslessShieldWrapperClient — an independent definition the SDK's encoders must match byte for byte.
+const INTERFACE_GASLESS_ABI = new Interface([
+  {
+    type: 'function', name: 'gaslessShield', stateMutability: 'nonpayable', outputs: [],
+    inputs: [
+      { name: 'params', type: 'tuple', components: [
+        { name: 'user', type: 'address' }, { name: 'deadline', type: 'uint256' }, { name: 'nonce', type: 'uint256' },
+        { name: 'integrator', type: 'address' }, { name: 'permitV', type: 'uint8' }, { name: 'permitR', type: 'bytes32' },
+        { name: 'permitS', type: 'bytes32' },
+      ] },
+      { name: 'intentSig', type: 'bytes' },
+      { name: 'shieldRequests', type: 'tuple[]', components: [
+        { name: 'preimage', type: 'tuple', components: [
+          { name: 'npk', type: 'bytes32' },
+          { name: 'token', type: 'tuple', components: [
+            { name: 'tokenType', type: 'uint8' }, { name: 'tokenAddress', type: 'address' }, { name: 'tokenSubID', type: 'uint256' },
+          ] },
+          { name: 'value', type: 'uint120' },
+        ] },
+        { name: 'ciphertext', type: 'tuple', components: [
+          { name: 'encryptedBundle', type: 'bytes32[3]' }, { name: 'shieldKey', type: 'bytes32' },
+        ] },
+      ] },
+    ],
+  },
+  {
+    type: 'function', name: 'gaslessCrossChainShield', stateMutability: 'nonpayable', outputs: [{ name: 'cctpNonce', type: 'uint64' }],
+    inputs: [
+      { name: 'params', type: 'tuple', components: [
+        { name: 'user', type: 'address' }, { name: 'deadline', type: 'uint256' }, { name: 'nonce', type: 'uint256' },
+        { name: 'maxFee', type: 'uint256' }, { name: 'minFinalityThreshold', type: 'uint32' }, { name: 'permitV', type: 'uint8' },
+        { name: 'permitR', type: 'bytes32' }, { name: 'permitS', type: 'bytes32' },
+      ] },
+      { name: 'intentSig', type: 'bytes' },
+      ...['userNote', 'feeNote'].map((name) => ({ name, type: 'tuple', components: [
+        { name: 'npk', type: 'bytes32' }, { name: 'value', type: 'uint120' }, { name: 'encryptedBundle', type: 'bytes32[3]' },
+        { name: 'shieldKey', type: 'bytes32' }, { name: 'integrator', type: 'address' },
+      ] })),
+    ],
+  },
+]);
+
+const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+const WRAPPER = `0x${'33'.repeat(20)}` as const;
+const SIG = `0x${'ab'.repeat(65)}` as const;
+const request = (n: bigint): ShieldRequest => ({
+  preimage: { npk: b32(n), token: { tokenType: 0, tokenAddress: USDC, tokenSubID: '0' }, value: 1_000n * n },
+  ciphertext: { encryptedBundle: [b32(n + 1n), b32(n + 2n), b32(n + 3n)], shieldKey: b32(n + 4n) },
+});
+const note = (n: bigint): ShieldData => ({
+  npk: b32(n) as `0x${string}`, value: 1_000n * n, encryptedBundle: [b32(n + 1n), b32(n + 2n), b32(n + 3n)],
+  shieldKey: b32(n + 4n) as `0x${string}`, integrator: `0x${'44'.repeat(20)}`,
+});
+const permit = { permitV: 27, permitR: b32(21n) as `0x${string}`, permitS: b32(22n) as `0x${string}` };
+
+describe('gasless wrapper calldata (#115)', () => {
+  // WHY: the SDK stopped at typed data, so every consumer hand-wrote these wrapper ABIs; and the relayer must pull
+  // the fee note back out of exactly this calldata to verify it.
+  it('gaslessShield: matches the deployed ABI byte for byte, targets the wrapper, and decodes back', () => {
+    const params = { user: `0x${'55'.repeat(20)}` as `0x${string}`, deadline: 1_000n, nonce: 4n, integrator: ZeroAddress as `0x${string}`, ...permit };
+    const shieldRequests = [request(10n), request(20n)];
+    const call = buildGaslessShieldCalldata({ wrapperAddress: WRAPPER, params, intentSig: SIG, shieldRequests });
+    const reference = INTERFACE_GASLESS_ABI.encodeFunctionData('gaslessShield', [
+      params,
+      SIG,
+      shieldRequests.map((r) => ({ preimage: { ...r.preimage, token: { ...r.preimage.token } }, ciphertext: r.ciphertext })),
+    ]);
+    expect(call).toEqual({ to: WRAPPER, data: reference, value: 0n });
+
+    const decoded = decodeGaslessShieldCalldata(call.data);
+    expect(decoded.params).toEqual(params);
+    expect(decoded.intentSig).toBe(SIG);
+    expect(hashShieldRequests(decoded.shieldRequests)).toBe(hashShieldRequests(shieldRequests));
+  });
+
+  it('gaslessCrossChainShield: matches the deployed ABI byte for byte, targets the client wrapper, and decodes back', () => {
+    const params = { user: `0x${'55'.repeat(20)}` as `0x${string}`, deadline: 1_000n, nonce: 4n, maxFee: 300n, minFinalityThreshold: 1000, ...permit };
+    const userNote = note(10n);
+    const feeNote = note(20n);
+    const call = buildGaslessCrossChainShieldCalldata({ clientWrapperAddress: WRAPPER, params, intentSig: SIG, userNote, feeNote });
+    const reference = INTERFACE_GASLESS_ABI.encodeFunctionData('gaslessCrossChainShield', [params, SIG, userNote, feeNote]);
+    expect(call).toEqual({ to: WRAPPER, data: reference, value: 0n });
+
+    const decoded = decodeGaslessCrossChainShieldCalldata(call.data);
+    expect(decoded.params).toEqual(params);
+    expect(decoded.intentSig).toBe(SIG);
+    expect(hashShieldData(decoded.userNote)).toBe(hashShieldData(userNote));
+    expect(hashShieldData(decoded.feeNote)).toBe(hashShieldData(feeNote));
+  });
+
+  it('the gasless decoders reject calldata for any other function', () => {
+    const other = buildLendAndShieldCalldata(tx(), { adapterAddress: ADAPTER, npk: 1n, shieldCiphertext: shieldCt }).data;
+    expect(() => decodeGaslessShieldCalldata(other)).toThrow(InvalidRequestError);
+    expect(() => decodeGaslessCrossChainShieldCalldata(other)).toThrow(InvalidRequestError);
   });
 });

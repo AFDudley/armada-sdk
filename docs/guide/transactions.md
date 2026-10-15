@@ -49,6 +49,11 @@ const fee = feeForOperation(quote, 'transfer'); // or 'unshield' | 'crossChainUn
 The quote's `feesCacheId` and `expiresAt` are for submitting to the relayer; planning doesn't use
 them.
 
+The fee note is paid in the token being spent, and the relayer only counts USDC. So a spend in any
+other token (vault shares, for example) can't carry a fee: `planTransfer` throws `InvalidRequestError`.
+A yield redeem pays its fee contract-side, so it plans with no `fee`. To merge non-USDC notes, use
+[`consolidate`](#consolidating-notes), which pays the fee from a separate USDC group.
+
 ## Plan a transfer
 
 `planTransfer` selects input notes and builds the plans for one spend — an array with one `Plan` per

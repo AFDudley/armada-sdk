@@ -2,7 +2,7 @@
 // ABOUTME: CrossChainShieldIntent for GaslessShieldWrapperClient.gaslessCrossChainShield (fee note bridged, minted on hub).
 
 import { keccak256, AbiCoder, TypedDataEncoder } from 'ethers';
-import { buildShieldRequest } from './shield';
+import { buildShieldRequest, type ShieldRequest } from './shield';
 import { grossUpShieldFee, type ShieldFeeTiers } from './shield-fee';
 
 const coder = AbiCoder.defaultAbiCoder();
@@ -74,39 +74,64 @@ export interface GaslessCrossChainShieldInput {
   };
 }
 
+/** A shield request's note as the on-chain `ShieldData` that crosses CCTP (its preimage + ciphertext + integrator). */
+export function shieldDataFromRequest(shieldRequest: ShieldRequest, integrator: `0x${string}`): ShieldData {
+  return {
+    npk: shieldRequest.preimage.npk as `0x${string}`,
+    value: shieldRequest.preimage.value,
+    encryptedBundle: shieldRequest.ciphertext.encryptedBundle,
+    shieldKey: shieldRequest.ciphertext.shieldKey as `0x${string}`,
+    integrator,
+  };
+}
+
+/**
+ * EIP-712 typed data for `GaslessShieldWrapperClient` (domain `ArmadaGaslessCrossChainShield`/`1`) — sign with the
+ * user's key. The intent binds each note by `hashShieldData`, so it can be built after the notes are saved.
+ */
+export function buildCrossChainShieldIntentTypedData(params: {
+  clientWrapperAddress: `0x${string}`;
+  chainId: number;
+  intent: CrossChainShieldIntent;
+}): CrossChainShieldIntentTypedData {
+  return {
+    domain: { name: 'ArmadaGaslessCrossChainShield', version: '1', chainId: params.chainId, verifyingContract: params.clientWrapperAddress },
+    types: CROSS_CHAIN_SHIELD_INTENT_TYPES,
+    message: params.intent,
+  };
+}
+
 /**
  * Assemble a gasless cross-chain shield: the two `ShieldData` notes (user + relayer fee, fee note carried
  * across CCTP and minted on the hub) and the EIP-712 `CrossChainShieldIntent` to sign. The caller signs
  * `typedData` plus a separate EIP-2612 permit (see `buildPermitTypedData`), then submits
- * `gaslessCrossChainShield(params, intentSig, userNote, feeNote)` via the relayer.
+ * `gaslessCrossChainShield(params, intentSig, userNote, feeNote)` via the relayer
+ * (`buildGaslessCrossChainShieldCalldata`). Each note's `random` is returned too: the relayer needs `feeRandom`
+ * to rebuild its fee note's npk and verify it. The same result can be built in stages (save-and-resume) from
+ * `buildShieldRequest`, `shieldDataFromRequest` and `buildCrossChainShieldIntentTypedData`.
  */
 export async function buildGaslessCrossChainShield(
   input: GaslessCrossChainShieldInput,
   shieldPrivateKey: Uint8Array,
-): Promise<{ userNote: ShieldData; feeNote: ShieldData; typedData: CrossChainShieldIntentTypedData }> {
-  const toShieldData = async (
-    s: { shieldedAddress: string; amount: bigint; tokenAddress: string; integrator: `0x${string}` },
-  ): Promise<ShieldData> => {
-    const { shieldRequest } = await buildShieldRequest(s, shieldPrivateKey);
-    return {
-      npk: shieldRequest.preimage.npk as `0x${string}`,
-      value: shieldRequest.preimage.value,
-      encryptedBundle: shieldRequest.ciphertext.encryptedBundle,
-      shieldKey: shieldRequest.ciphertext.shieldKey as `0x${string}`,
-      integrator: s.integrator,
-    };
-  };
-
-  const userNote = await toShieldData(input.userShield);
+): Promise<{
+  userNote: ShieldData;
+  feeNote: ShieldData;
+  typedData: CrossChainShieldIntentTypedData;
+  userRandom: string;
+  feeRandom: string;
+}> {
+  const user = await buildShieldRequest(input.userShield, shieldPrivateKey);
   const feeValue = input.feeShield.grossUp !== undefined
     ? grossUpShieldFee(input.feeShield.amount, input.feeShield.grossUp)
     : input.feeShield.amount;
-  const feeNote = await toShieldData({ ...input.feeShield, amount: feeValue });
+  const fee = await buildShieldRequest({ ...input.feeShield, amount: feeValue }, shieldPrivateKey);
+  const userNote = shieldDataFromRequest(user.shieldRequest, input.userShield.integrator);
+  const feeNote = shieldDataFromRequest(fee.shieldRequest, input.feeShield.integrator);
 
-  const typedData: CrossChainShieldIntentTypedData = {
-    domain: { name: 'ArmadaGaslessCrossChainShield', version: '1', chainId: input.chainId, verifyingContract: input.clientWrapperAddress },
-    types: CROSS_CHAIN_SHIELD_INTENT_TYPES,
-    message: {
+  const typedData = buildCrossChainShieldIntentTypedData({
+    clientWrapperAddress: input.clientWrapperAddress,
+    chainId: input.chainId,
+    intent: {
       user: input.user,
       userNoteHash: hashShieldData(userNote),
       feeNoteHash: hashShieldData(feeNote),
@@ -115,8 +140,8 @@ export async function buildGaslessCrossChainShield(
       deadline: input.deadline,
       nonce: input.nonce,
     },
-  };
-  return { userNote, feeNote, typedData };
+  });
+  return { userNote, feeNote, typedData, userRandom: user.random, feeRandom: fee.random };
 }
 
 /** The EIP-712 digest the client wrapper verifies for a CrossChainShieldIntent. */
