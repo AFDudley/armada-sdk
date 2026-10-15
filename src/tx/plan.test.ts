@@ -4,8 +4,8 @@
 import { describe, it, expect } from 'vitest';
 import { getTokenDataERC20, getTokenDataHash } from '../core/index';
 import type { TXO } from '../sync/index';
-import { InsufficientBalanceError, UnsupportedCircuitShapeError } from '../errors';
-import { planTransfer, planWitnessInputs } from './plan';
+import { InsufficientBalanceError, InvalidRequestError, UnsupportedCircuitShapeError } from '../errors';
+import { planSpend, planTransfer, planWitnessInputs } from './plan';
 import { encodeCctpBinding } from './adapt-params';
 import type { Plan } from './index';
 
@@ -87,7 +87,7 @@ describe('planTransfer (§4.6)', () => {
 
   it('surfaces a matching decoded CCTP binding on boundParams.decodedAdaptParams, rejects a mismatch (M2)', () => {
     const RECIPIENT_EVM = `0x${'ab'.repeat(20)}` as const;
-    const binding = { kind: 'cctp' as const, recipient: RECIPIENT_EVM, destDomain: 3, maxFee: 500n };
+    const binding = { kind: 'cctp' as const, recipient: RECIPIENT_EVM, destDomain: 3, maxFee: 1n };
     const adaptParams = encodeCctpBinding(binding.recipient, binding.destDomain, binding.maxFee);
     const plan = planTransfer({
       ...base,
@@ -105,6 +105,30 @@ describe('planTransfer (§4.6)', () => {
         unshield: { recipient: RECIPIENT_EVM, value: 5n, adaptParams, adaptBinding: { ...binding, destDomain: 9 } },
       }),
     ).toThrow(/does not match/);
+  });
+
+  describe('unshield shapes the pool rejects on-chain (#134)', () => {
+    // WHY: the pool reverts these after ~30s of proving (and a relayer gas-estimate failure). The planner
+    // must refuse them up front, so no caller can build a proof that is dead on arrival.
+    const RECIPIENT_EVM = `0x${'ab'.repeat(20)}` as const;
+    const FEE = { broadcasterShieldedAddress: BROADCASTER, value: 2n };
+
+    it('rejects a zero-value unshield, even when a fee note makes the spend positive ("Invalid Unshield Value")', () => {
+      const params = { ...base, outputs: [], txos: [txo(0, 10n)], fee: FEE, unshield: { recipient: RECIPIENT_EVM, value: 0n } };
+      expect(() => planTransfer(params)).toThrow(InvalidRequestError);
+      expect(() => planSpend(params)).toThrow(/unshield value must be positive/);
+    });
+
+    it('rejects a cross-chain unshield whose CCTP maxFee is not strictly below its value ("maxFee must be below amount")', () => {
+      const bound = (maxFee: bigint) => {
+        const binding = { kind: 'cctp' as const, recipient: RECIPIENT_EVM, destDomain: 3, maxFee };
+        const adaptParams = encodeCctpBinding(binding.recipient, binding.destDomain, binding.maxFee);
+        return { ...base, outputs: [], txos: [txo(0, 10n)], unshield: { recipient: RECIPIENT_EVM, value: 5n, adaptParams, adaptBinding: binding } };
+      };
+      expect(() => planTransfer(bound(5n))).toThrow(InvalidRequestError); // equal: rejected (strict)
+      expect(() => planSpend(bound(9n))).toThrow(/maxFee .* below the unshield value/);
+      expect(planTransfer(bound(4n)).summary.unshield?.value).toBe(5n);
+    });
   });
 
   it('binds unshield.adaptContract into boundParams.adaptContract (relay-adapt / yield adapter)', () => {

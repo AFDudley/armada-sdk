@@ -6,6 +6,7 @@ import { getTokenDataERC20, getTokenDataHash } from '../core/index';
 import type { TXO } from '../sync/index';
 import { maxTransferAmount, maxUnshieldAmount } from './max-transfer';
 import { planSpend } from './plan';
+import { encodeCctpBinding } from './adapt-params';
 
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' as const;
 const DAI = '0x6b175474e89094c44da98b954eedeac495271d0f' as const;
@@ -157,6 +158,20 @@ describe('maxUnshieldAmount', () => {
   it('is zero when nothing can be unshielded', () => {
     expect(maxUnshieldAmount(unshield([], 1n))).toBe(0n);
     expect(maxUnshieldAmount(unshield([txo(1n)], 1n))).toBe(0n);
+  });
+
+  it('a cross-chain unshield only counts amounts strictly above its CCTP maxFee (#134)', () => {
+    // WHY: the pool rejects a cross-chain unshield whose maxFee is not below its value. The Max must report
+    // what can actually be sent — and 0, not an error, when the notes can't clear the maxFee.
+    const crossChain = (txos: TXO[], maxFee: bigint) => {
+      const binding = { kind: 'cctp' as const, recipient: EVM, destDomain: 3, maxFee };
+      const adaptParams = encodeCctpBinding(binding.recipient, binding.destDomain, binding.maxFee);
+      return { ...params(txos, 1n), unshield: { recipient: EVM, adaptParams, adaptBinding: binding } };
+    };
+    expect(maxUnshieldAmount(crossChain([txo(10n), txo(4n)], 5n))).toBe(13n); // 14 − 1; above the maxFee
+    // The largest tree candidate (8 − 1 = 7) doesn't clear maxFee 7, nor does any smaller one.
+    expect(maxUnshieldAmount(crossChain([txo(5n), txo(3n)], 7n))).toBe(0n);
+    expect(maxUnshieldAmount(crossChain([txo(10n)], 9n))).toBe(0n); // 10 − 1 = 9: equal is not below
   });
 
   it('matches a brute-force search over every amount, across random wallets', () => {

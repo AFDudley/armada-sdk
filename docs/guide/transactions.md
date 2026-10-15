@@ -124,8 +124,8 @@ spend, less one fee — pass the fee for the unshield's destination:
 await wallet.maxUnshieldAmount({ fee: feeForOperation(quote, 'unshield') }); // a plain unshield
 await wallet.maxUnshieldAmount({
   fee: feeForOperation(quote, 'crossChainUnshield'),
-  unshield: { recipient: pool, adaptParams },
-}); // cross-chain
+  unshield: { recipient: pool, adaptParams, adaptBinding },
+}); // cross-chain: only amounts above the binding's maxFee count
 ```
 
 Notes held by a pending spend are left out of both, as they are for `planTransfer`.
@@ -185,9 +185,35 @@ const [plan] = await wallet.planTransfer({
 ```
 
 An unshield is never split, so it always plans as a single proof. The unshield is reflected in
-`plan.summary.unshield` as `{ recipient, value }`. For cross-chain
-unshields, `unshield` also accepts `adaptParams` and `adaptContract` that bind the destination into
-the transaction; a decoded `adaptBinding` is surfaced to the signer for inspection.
+`plan.summary.unshield` as `{ recipient, value }`. Its `amount` must be above zero: the pool rejects a
+zero-value unshield, so `planTransfer` throws `InvalidRequestError` rather than letting you prove one.
+
+For a cross-chain (CCTP) unshield, `unshield` also takes `adaptParams`, which binds the destination into
+the proof, and the decoded `adaptBinding` it was built from. The decoded binding is surfaced to the signer
+for inspection:
+
+```ts
+const adaptBinding = { kind: 'cctp', recipient: finalRecipient, destDomain, maxFee };
+const adaptParams = encodeCctpBinding(finalRecipient, destDomain, maxFee);
+
+const [plan] = await wallet.planTransfer({
+  outputs: [],
+  unshield: { recipient: pool, amount, adaptParams, adaptBinding },
+  fee: feeForOperation(quote, 'crossChainUnshield'),
+});
+```
+
+The hub pool rejects a cross-chain unshield that breaks any of its rules, so `planTransfer` checks them up
+front and throws `InvalidRequestError` instead of letting you prove:
+
+- the decoded `adaptBinding` is present and matches `adaptParams`;
+- the token is USDC (CCTP bridges USDC only);
+- `recipient` is the pool itself (the final recipient is in the binding);
+- there is no `adaptContract`;
+- the binding's `maxFee` is below the unshield `amount`.
+
+An unshield to the yield adapter (`adaptContract` set to the adapter) is not cross-chain and needs no
+binding.
 
 ## Preflight
 

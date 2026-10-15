@@ -580,6 +580,9 @@ const tx = buildTransactCalldata(handles.map((h) => h.toTransactionData()), pool
   yield adapter binding (parity with current `encodeYieldAdaptParams` /
   `encodeYieldAdaptParamsWithFee`). Wrapper call encoding (`lendAndShield`, `redeemAndShield`,
   `atomicCrossChainUnshield`) is provided as calldata builders.
+- **Unshield shapes the pool rejects fail at plan time** (#134), not after proving: a zero-value unshield,
+  and a cross-chain unshield that lacks its decoded binding, isn't USDC, doesn't pay the pool, names an
+  `adaptContract`, or has `maxFee >= value`.
 - **Decode API for verifiers.** The pure `decodeTransact(calldata)` understands both bare
   `transact()` and the wrapper entry points natively, and `extractFeeOutput(decoded, broadcasterKeys,
   tokenDataGetter)` recovers the broadcaster fee note (bound to its commitment). Both are plain

@@ -49,20 +49,26 @@ export function maxTransferAmount(params: MaxTransferParams): bigint {
  * planner may fold a small change into the fee; at the max there is no change, so that never raises it.)
  */
 export function maxUnshieldAmount(params: MaxUnshieldParams): bigint {
-  return largestPlannable(params, 1, (amount) => ({
-    ...params,
-    outputs: [],
-    unshield: { ...params.unshield, value: amount },
-  }));
+  // A cross-chain unshield must be worth more than its CCTP maxFee (the pool rejects maxFee >= value), so
+  // amounts at or below it aren't available.
+  const floor = params.unshield.adaptBinding?.maxFee ?? 0n;
+  return largestPlannable(
+    params,
+    1,
+    (amount) => ({ ...params, outputs: [], unshield: { ...params.unshield, value: amount } }),
+    floor,
+  );
 }
 
-/** The largest candidate `amount` whose spend (`spendOf(amount)`) the planner can build, or 0. */
+/** The largest candidate `amount` above `floor` whose spend (`spendOf(amount)`) the planner can build, or 0. */
 function largestPlannable(
   params: MaxTransferParams,
   maxProofs: number,
   spendOf: (amount: bigint) => PlanTransferParams,
+  floor = 0n,
 ): bigint {
   for (const amount of candidateAmounts(params, maxProofs)) {
+    if (amount <= floor) break; // candidates are sorted largest first
     if (plans(spendOf(amount))) return amount;
   }
   return 0n;
