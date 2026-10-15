@@ -585,7 +585,8 @@ const tx = buildTransactCalldata(handles.map((h) => h.toTransactionData()), pool
   `adaptContract`, or has `maxFee >= value`.
 - **Decode API for verifiers.** The pure `decodeTransact(calldata)` understands both bare
   `transact()` and the wrapper entry points natively, and `extractFeeOutput(decoded, broadcasterKeys,
-  tokenDataGetter)` recovers the broadcaster fee note (bound to its commitment). Both are plain
+  tokenDataGetter)` recovers the broadcaster fee note, bound to the commitment at its
+  ciphertext's own index (the index the broadcaster's scanner uses to find it). Both are plain
   functions (no SDK instance needed), replacing the relayer's synthetic-calldata normalization in
   `broadcaster-fee-verifier.ts` with a supported API. For the shield path, the SDK provides
   the **npk-reconstruction fee verification** primitive (per #410's v1 relayer): given a
