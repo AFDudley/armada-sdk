@@ -31,7 +31,9 @@ and API stay the same.
 :::
 
 The package builds ES module and CommonJS output with TypeScript type declarations. It targets
-modern browsers and Node (CI runs on Node 20).
+modern browsers and Node (CI runs on Node 20). In Node, `require` loads the CommonJS build, while
+`import` loads the same ES module build browsers use; it imports cleanly in Node, with no browser
+globals needed.
 
 The crypto core runs in WebAssembly (Poseidon hashing and curve25519). `createArmadaSdk` awaits both
 WASM modules before it returns, so there is no separate initialization step to call.

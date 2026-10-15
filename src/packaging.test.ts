@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { distAvailable } from '../test/dist-guard';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -36,15 +36,8 @@ function esmGraph(entry: string): string[] {
 const BROWSER_ENTRIES = ['index.js', 'core/index.js', 'wallet/index.js', 'prover/index.js', 'prover/worker.js'];
 
 describe('one engine copy across entries (#116)', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
   it('ESM: the root, /core, /wallet and /prover share module state and classes', async (ctx) => {
     if (!distAvailable(ctx)) return;
-    // The ESM build targets browsers: its bundled `process` polyfill reads `navigator.language` on load.
-    // Node 21+ defines `navigator`; on older Node, supply the one browser global it needs.
-    if ((globalThis as { navigator?: unknown }).navigator === undefined) vi.stubGlobal('navigator', { language: 'en-US' });
     const load = (p: string): Promise<Record<string, unknown>> => import(pathToFileURL(join(DIST, p)).href);
     const [root, core, wallet, prover] = await Promise.all(['index.js', 'core/index.js', 'wallet/index.js', 'prover/index.js'].map(load));
     expect(core!.initPoseidonPromise).toBe(root!.initPoseidonPromise);
@@ -67,6 +60,25 @@ describe('one engine copy across entries (#116)', () => {
     const err = await (wallet!.deriveKeyset as (s: Uint8Array) => Promise<unknown>)(new Uint8Array(3)).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(root!.ArmadaError as new () => Error);
   });
+});
+
+describe('the ESM build in plain Node (#131)', () => {
+  it('every browser entry imports with no browser globals (Node < 21 has no `navigator`)', (ctx) => {
+    // WHY: Node ES-module importers (e.g. relayer-v2 on Node 20) get the `import` build. A bundled polyfill read
+    // `navigator.language` on load and crashed there. A child process deletes `navigator` first, so this holds on
+    // any Node version.
+    if (!distAvailable(ctx)) return;
+    for (const entry of ['index.js', 'core/index.js', 'wallet/index.js', 'prover/index.js', 'internal/index.js']) {
+      const script = `delete globalThis.navigator; await import(${JSON.stringify(pathToFileURL(join(DIST, entry)).href)});`;
+      let failure = '';
+      try {
+        execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', stdio: 'pipe' });
+      } catch (err) {
+        failure = (err as { stderr: string }).stderr.split('\n').find((l) => /Error/.test(l)) ?? 'failed';
+      }
+      expect(failure, `${entry} failed to import`).toBe('');
+    }
+  }, 120_000);
 });
 
 describe('browser chunks', () => {
