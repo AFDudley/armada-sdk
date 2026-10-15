@@ -21,7 +21,7 @@ import { saveScanState, WalletScanState, walletRecordId } from './internal/index
 import { MemoryStorageAdapter } from './storage/index';
 import { NoSpendCapabilityError, InvalidKeyMaterialError, InvalidRequestError, UnsupportedCircuitShapeError } from './errors';
 import { initPoseidonPromise, Mnemonic, getTokenDataERC20, getTokenDataHash } from './core/index';
-import { feeForOperation } from './tx/index';
+import { feeForOperation, encodeCctpBinding } from './tx/index';
 import type { ProverAdapter, ArtifactSource, ArtifactSet, Groth16Proof } from './prover/index';
 import type { ArmadaSdkConfig } from './index';
 import type { Plan } from './tx/index';
@@ -634,7 +634,7 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
   async function walletWithNotes(
     notesByTree: Record<number, bigint[]>,
     shapes: string[] | null = SHAPES,
-    poolOptions: { sweepNoteThreshold?: number } = {},
+    poolOptions: Partial<ArmadaSdkConfig['pool']> = {},
   ) {
     await initPoseidonPromise;
     const store = new MemoryStorageAdapter();
@@ -662,6 +662,71 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
     const wallet = await sdk.wallet.fromRootSecret(seed(0x55), { creationBlock: 1 }); // loads the saved scan state
     return { sdk, wallet };
   }
+
+  // A cross-chain (CCTP) unshield destination the pool accepts: it pays the pool (`0x11…`, the test pool), and its
+  // decoded binding matches its adaptParams. Callers override fields to break one rule at a time.
+  const POOL = `0x${'11'.repeat(20)}` as const;
+  function crossChainDestination(maxFee: bigint) {
+    const binding = { kind: 'cctp' as const, recipient: `0x${'ab'.repeat(20)}` as `0x${string}`, destDomain: 3, maxFee };
+    const adaptParams = encodeCctpBinding(binding.recipient, binding.destDomain, binding.maxFee);
+    return { recipient: POOL as `0x${string}`, adaptParams, adaptBinding: binding };
+  }
+
+  describe('cross-chain unshields the pool rejects on-chain (#134)', () => {
+    // WHY: the hub pool reverts a cross-chain unshield that isn't USDC, doesn't pay the pool, names an
+    // adaptContract, or has maxFee >= its value — after ~30s of proving. The wallet refuses them at plan time.
+    const plan = (wallet: Awaited<ReturnType<typeof walletWithNotes>>['wallet'], unshield: object, tokenAddress?: `0x${string}`) =>
+      wallet.planTransfer({ outputs: [], unshield: { amount: 10n, ...unshield } as never, ...(tokenAddress ? { tokenAddress } : {}) });
+
+    it('plans a well-formed cross-chain unshield (USDC, pays the pool, decoded binding)', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      const [p] = await plan(wallet, crossChainDestination(1n));
+      expect(p!.boundParams.decodedAdaptParams?.maxFee).toBe(1n);
+      await sdk.close();
+    });
+
+    it('requires the decoded adaptBinding, so the maxFee rule can be checked', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      const { recipient, adaptParams } = crossChainDestination(1n);
+      const withoutBinding = { recipient, adaptParams };
+      await expect(plan(wallet, withoutBinding)).rejects.toThrow(/needs unshield.adaptBinding/);
+      await expect(wallet.maxUnshieldAmount({ unshield: withoutBinding })).rejects.toBeInstanceOf(InvalidRequestError);
+      await sdk.close();
+    });
+
+    it('requires it to pay the pool ("Cross-chain unshield must pay the pool")', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      await expect(plan(wallet, { ...crossChainDestination(1n), recipient: `0x${'ab'.repeat(20)}` })).rejects.toThrow(/must pay the pool/);
+      await sdk.close();
+    });
+
+    it('requires USDC ("Cross-chain unshield is USDC-only")', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      const DAI = '0x6b175474e89094c44da98b954eedeac495271d0f' as const;
+      await expect(plan(wallet, crossChainDestination(1n), DAI)).rejects.toThrow(/USDC/);
+      await sdk.close();
+    });
+
+    it('rejects an adaptContract ("unexpected adaptContract")', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      await expect(plan(wallet, { ...crossChainDestination(1n), adaptContract: `0x${'cc'.repeat(20)}` })).rejects.toThrow(/adaptContract/);
+      await sdk.close();
+    });
+
+    it('rejects maxFee >= the unshield value ("maxFee must be below amount")', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      await expect(plan(wallet, crossChainDestination(10n))).rejects.toThrow(InvalidRequestError);
+      await sdk.close();
+    });
+
+    it('leaves a yield-adapter unshield alone (it is not cross-chain, so needs no CCTP binding)', async () => {
+      const ADAPTER = `0x${'ad'.repeat(20)}` as const;
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] }, SHAPES, { wrappers: { yieldAdapter: ADAPTER } });
+      const [p] = await plan(wallet, { recipient: ADAPTER, adaptContract: ADAPTER, adaptParams: `0x${'ef'.repeat(32)}` });
+      expect(p!.boundParams.adaptContract.toLowerCase()).toBe(ADAPTER);
+      await sdk.close();
+    });
+  });
 
   it('plans a consolidation with each input\'s merkle proof, old-tree notes first, at the transfer fee', async () => {
     const { sdk, wallet } = await walletWithNotes({ 0: [9n], 1: [1n, 2n, 3n] });
@@ -750,8 +815,7 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
     it('maxUnshieldAmount: a CCTP-bound unshield at its (cross-chain) per-proof fee', async () => {
       const { sdk, wallet } = await walletWithNotes({ 0: Array.from({ length: 7 }, () => 10n) })
       const fee = { ...FEE, perProof: 5n }
-      const unshield = { recipient: `0x${'ab'.repeat(20)}` as const, adaptParams: `0x${'cd'.repeat(32)}` as const }
-      expect(await wallet.maxUnshieldAmount({ fee, unshield })).toBe(55n) // 60 − 5
+      expect(await wallet.maxUnshieldAmount({ fee, unshield: crossChainDestination(1n) })).toBe(55n) // 60 − 5
       await sdk.close()
     })
 

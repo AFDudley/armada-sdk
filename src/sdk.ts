@@ -992,8 +992,45 @@ class ArmadaWallet implements Wallet {
     return roots;
   }
 
+  /**
+   * Reject a cross-chain (CCTP) unshield the hub pool would revert (#134), before any proving. It is cross-chain
+   * when it carries a CCTP binding, or commits `adaptParams` to anything but the yield adapter (the same test
+   * preflight uses). It must then:
+   *   - carry its decoded `adaptBinding`, so the planner can check `maxFee < value`;
+   *   - spend USDC (CCTP bridges USDC only);
+   *   - pay the pool (the final recipient is in the binding);
+   *   - name no `adaptContract`.
+   */
+  private assertCrossChainUnshield(request: PlanTransferRequest): void {
+    const unshield = request.unshield;
+    if (unshield === undefined) return;
+    const crossChain =
+      unshield.adaptBinding !== undefined ||
+      (unshield.adaptParams !== undefined &&
+        isCrossChainUnshield(
+          { adaptContract: unshield.adaptContract ?? `0x${'00'.repeat(20)}`, adaptParams: unshield.adaptParams },
+          this.ctx.yieldAdapterAddress,
+        ));
+    if (!crossChain) return;
+    if (unshield.adaptBinding === undefined) {
+      throw new InvalidRequestError('cross-chain unshield: needs unshield.adaptBinding (the decoded CCTP destination matching adaptParams)');
+    }
+    if (unshield.adaptContract !== undefined && BigInt(unshield.adaptContract) !== 0n) {
+      throw new InvalidRequestError('cross-chain unshield: must not name an adaptContract (the pool rejects it)');
+    }
+    if ((request.tokenAddress ?? this.ctx.usdcAddress).toLowerCase() !== this.ctx.usdcAddress.toLowerCase()) {
+      throw new InvalidRequestError('cross-chain unshield: must spend USDC (CCTP bridges USDC only)');
+    }
+    if (unshield.recipient.toLowerCase() !== this.ctx.poolAddress.toLowerCase()) {
+      throw new InvalidRequestError(
+        'cross-chain unshield: must pay the pool (unshield.recipient is the pool address; the final recipient is in the CCTP binding)',
+      );
+    }
+  }
+
   // The planner request for a transfer/unshield over `txos`.
   private spendParams(request: PlanTransferRequest, txos: readonly TXO[], roots: ReadonlyMap<number, bigint>): PlanTransferParams {
+    this.assertCrossChainUnshield(request);
     // The caller's fee is PER PROOF: a split spend pays it once per group (planSpend scales it). No fee
     // (or zero) means no fee note.
     const fee = request.fee;

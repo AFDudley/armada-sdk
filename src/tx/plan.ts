@@ -208,12 +208,29 @@ function spendTarget(params: PlanTransferParams): bigint {
   return target;
 }
 
-function assertAdaptBinding(params: PlanTransferParams): void {
-  const adaptBinding = params.unshield?.adaptBinding;
+/**
+ * Reject an unshield the pool would revert on-chain (#134), before any notes are selected or proving starts:
+ * a zero-value unshield ("Invalid Unshield Value"), a decoded CCTP binding that doesn't match the committed
+ * `adaptParams`, and a cross-chain unshield whose `maxFee` isn't strictly below its value ("maxFee must be
+ * below amount"). The cross-chain rules that need the deployment's addresses (USDC only, pays the pool, no
+ * adaptContract) are checked by the wallet, which knows them.
+ */
+function assertUnshieldShape(params: PlanTransferParams): void {
+  const unshield = params.unshield;
+  if (unshield === undefined) return;
+  if (unshield.value <= 0n) {
+    throw new InvalidRequestError('planTransfer: unshield value must be positive (the pool rejects a zero-value unshield)');
+  }
+  const adaptBinding = unshield.adaptBinding;
   if (adaptBinding === undefined) return;
-  const encoded = params.unshield?.adaptParams;
+  const encoded = unshield.adaptParams;
   if (encoded === undefined || !verifyCctpBinding(encoded, adaptBinding.recipient, adaptBinding.destDomain, adaptBinding.maxFee)) {
     throw new InvalidRequestError('planTransfer: unshield.adaptBinding does not match unshield.adaptParams');
+  }
+  if (adaptBinding.maxFee >= unshield.value) {
+    throw new InvalidRequestError(
+      `planTransfer: the CCTP maxFee (${adaptBinding.maxFee.toString()}) must be below the unshield value (${unshield.value.toString()})`,
+    );
   }
 }
 
@@ -224,6 +241,7 @@ export function shapeSupported(supported: ReadonlySet<string> | undefined, shape
 
 /** Select the fewest-input single-tree cover for the whole spend and assemble it as ONE group. */
 function planSingleGroup(params: PlanTransferParams, caller: string): PlanSelection {
+  assertUnshieldShape(params);
   const target = spendTarget(params);
   const cover = pickFewestInputCover(params, target);
   if (cover === undefined) {
@@ -231,7 +249,6 @@ function planSingleGroup(params: PlanTransferParams, caller: string): PlanSelect
       `${caller}: no single tree covers ${target.toString()} of token ${params.tokenAddress}`,
     );
   }
-  assertAdaptBinding(params);
   return assembleSelection(params, cover, singleGroupOutputs(params, cover.total - target));
 }
 
