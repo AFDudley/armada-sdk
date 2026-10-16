@@ -280,8 +280,9 @@ them entirely — no POI code exists to stub:
   flag or `preTransactionPOIsPerTxidLeafPerList` return on transaction generation; no POI
   status fields in TXO storage records; the balance model collapses from Railgun's
   `WalletBalanceBucket` POI buckets to a simple spendable/pending model.
-- **Guard:** Phase 1 acceptance includes `rg "POI" src/ vendor/` (case-sensitive — POI is
-  uppercase in all upstream identifiers) returning nothing in the SDK repo.
+- **Guard:** Phase 1 acceptance includes `rg --pcre2 "POI(?!NT)" src/ vendor/` (case-sensitive —
+  POI is uppercase in all upstream identifiers; not followed by `NT`, so words like `CHECKPOINT`
+  don't match) returning nothing in the SDK repo. CI runs the same check.
 - **Rationale:** PPOI is Railgun-network compliance infrastructure; nothing in Armada's
   contracts or circuits consumes POI data, and Armada's compliance story is voluntary
   selective disclosure (§5.3). Note: the 9.5.4 upstream fix titled "POI spentTXO filtering by
@@ -520,8 +521,12 @@ Requirements:
 - **Progress + events.** `sdk.sync.status()` and subscription events
   (`scan:started/progress/complete/error`, `balance:updated`, `note:received` — see §5.2)
   replace the single global `setOnBalanceUpdateCallback` multiplexer.
-- **Checkpointing.** Scan checkpoints per (wallet, chain) live in storage (replacing the
-  localStorage `history-checkpoint.ts`), covered by the schema-version reset rule.
+- **Checkpointing.** Scan state per (wallet, chain) lives in storage (replacing the
+  localStorage `history-checkpoint.ts`), covered by the schema-version reset rule, as three kinds of
+  record: a checkpoint (synced block, its hash, each tree's length), the wallet's notes (its owned
+  notes and only its own spends — not every pool nullifier and unshield), and each tree's leaves in
+  1,024-leaf chunks. A save writes the changed chunks, the notes and the checkpoint in one atomic
+  batch; any unreadable or inconsistent record is a cache miss, and the wallet rescans.
 - **Quick-sync interface (optional, deferred within Phase 2):**
   `interface EventSource { getEvents(fromBlock, toBlock): Promise<AccumulatedEvents> }` — an
   indexer-backed implementation can later serve snapshots to cut first-scan time (the crowdfund
