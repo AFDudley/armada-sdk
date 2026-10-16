@@ -33,7 +33,8 @@ API (an insecure context, or a very old browser), it refuses to open rather than
 harness without Web Locks (jsdom, or Node with fake-indexeddb) passes
 `new IndexedDBStorageAdapter(name, { dangerouslySkipLock: true })`. `LevelStorageAdapter` relies on the
 database's own lock and reports a second process as `StorageConflictError` too. Opening an adapter
-that is already open under a different deployment also throws `StorageConflictError`.
+that is already open under a different deployment also throws `StorageConflictError`. Once closed,
+an adapter rejects every call with `InstanceClosedError` until it is opened again.
 
 Note data is [encrypted at rest](./security) on top of whatever adapter you pass, and each wallet's
 records are kept in their own scope, so a custom adapter does not need to handle encryption or

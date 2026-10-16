@@ -6,7 +6,7 @@
 //   ES2022 (no DOM) since the SDK also targets Node. Node consumers never instantiate this class.
 
 import type { StorageAdapter, StorageNamespace, StorageOp, StorageWriteOptions } from './index';
-import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding } from './namespace';
+import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding, assertNotClosed } from './namespace';
 import { StorageConflictError } from '../errors';
 
 const STORE = 'kv';
@@ -56,6 +56,9 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
   private lockRelease: (() => void) | undefined;
   // The namespace this adapter is open under, until close().
   private bound: Uint8Array | undefined;
+  // Set by close(), cleared by open(): a closed adapter rejects every other call, rather than quietly reopening the
+  // database without the lock.
+  private closed = false;
 
   constructor(
     private readonly dbName: string,
@@ -104,6 +107,7 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
   }
 
   private async database(): Promise<IDBDatabase> {
+    assertNotClosed('IndexedDBStorageAdapter', this.closed);
     if (this.db !== undefined) return this.db;
     this.db = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(this.dbName, 1);
@@ -124,6 +128,7 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
   async open(namespace: StorageNamespace): Promise<{ reset: boolean }> {
     const nsBytes = encodeNamespace(namespace);
     if (assertSameBinding('IndexedDBStorageAdapter', this.bound, nsBytes)) return { reset: false };
+    this.closed = false;
     await this.acquireLock();
     await this.database();
     const previous = await this.get(NAMESPACE_KEY);
@@ -227,5 +232,6 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
     this.lockRelease?.();
     this.lockRelease = undefined;
     this.bound = undefined;
+    this.closed = true;
   }
 }

@@ -182,6 +182,14 @@ export interface Wallet {
    * you've just synced explicitly). Works view-only. Throws `InvalidRequestError` if already watching.
    */
   watch(options?: { intervalMs?: number; immediate?: boolean; onError?: (err: Error) => void }): Unsubscribe;
+  /**
+   * Release the wallet (SPEC §4.1): stop its watcher, cancel an in-flight sync or proof and wait for it to settle (it
+   * rejects with `InstanceClosedError`; a proof's signal fires, so a signer waiting on approval can stop), dispose the
+   * signer the SDK made for it (one you passed in is yours to dispose), and wipe its viewing key. Every call afterwards throws `InstanceClosedError`; calling it again does
+   * nothing. `sdk.close()` disposes every wallet still open, so call this for a wallet you're done with before then
+   * (e.g. an ephemeral claim wallet). Key wiping is best-effort: JavaScript can't wipe bigint or string copies.
+   */
+  dispose(): Promise<void>;
 }
 
 export interface PlanTransferRequest {

@@ -97,7 +97,7 @@ Spend authorization goes through a `SpendSigner`:
 ```ts
 interface SpendSigner {
   getSpendingPublicKey(): Promise<[bigint, bigint]>;
-  signBatch(requests: readonly SpendSignRequest[]): Promise<EddsaSignature[]>;
+  signBatch(requests: readonly SpendSignRequest[], options?: { signal?: AbortSignal }): Promise<EddsaSignature[]>;
   dispose?(): void;
 }
 ```
@@ -121,7 +121,50 @@ const wallet = await sdk.wallet.fromRootSecret(rootSecret, {
 ```
 
 An explicit `signer` always takes precedence over the default `LocalSigner`. `fromMnemonic` accepts
-the same `signer` option.
+the same `signer` option. The signer must hold the wallet's spending key: if `getSpendingPublicKey()`
+returns another key, loading the wallet fails with `SignerContractViolationError`. Each signature the
+signer returns is checked against that key before proving, with the same error if it doesn't verify.
+
+`signBatch` receives the proof's `AbortSignal`, if the caller passed one to `prove` or `proveAll`. A
+signer that waits on a person or a remote service should stop waiting and reject when it fires. If it
+fires while the signer is working, the SDK discards whatever comes back and throws `AbortedError`
+instead of proving.
+
+### Keeping the spend key out of the SDK
+
+`fromRootSecret` and `fromMnemonic` derive the spend key from the secret, even when you pass a signer;
+the SDK zeroes that copy at once, but it was in memory. To keep it out of the SDK entirely, load the
+wallet from its shareable viewing key and attach the signer there:
+
+```ts
+const wallet = await sdk.wallet.viewOnlyFromViewingKey(shareableViewingKey, {
+  creationBlock: 21_000_000,
+  signer, // e.g. an ExternalSigner over your HSM
+});
+wallet.canSpend; // true
+```
+
+Without a `signer`, the wallet is view-only. See [Security](./security#spending-and-viewing) for what
+key wiping can and can't guarantee.
+
+## Disposing a wallet
+
+`wallet.dispose()` releases a wallet you're done with. It stops the wallet's watcher, cancels an
+in-flight sync or proof and waits for it to settle (it rejects with `InstanceClosedError`), disposes the
+signer the SDK made for the wallet, and wipes the wallet's viewing key. Cancelling a proof fires the
+signal its signer receives, so a signer waiting on approval should stop waiting; one that ignores the
+signal holds `dispose()` until it answers. A signer you passed in is yours to
+dispose, since it may serve other wallets. Every call on the wallet afterwards throws
+`InstanceClosedError`; calling `dispose()` again does nothing.
+
+```ts
+const claim = await sdk.wallet.ephemeralFromSeed(seed);
+// ... claim the payment ...
+await claim.dispose();
+```
+
+`sdk.close()` disposes every wallet still open, so you only need `dispose()` for a wallet you finish
+with earlier — an ephemeral claim wallet, or a user who logs out.
 
 ## Sharing a viewing key
 

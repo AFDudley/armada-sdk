@@ -66,6 +66,19 @@ A wallet's ability to spend lives behind a signer, separate from its ability to 
 wallets and shareable viewing keys grant read access — scanning, balances, history — without spend
 power.
 
-To keep spend keys out of the SDK entirely, attach an [`ExternalSigner`](./wallets#signers) that
-produces signatures in your own backend. A signer may also implement `dispose()` to release held key
-material when it is no longer needed.
+To keep the spend key out of the SDK entirely, load the wallet from its shareable viewing key and
+attach an [`ExternalSigner`](./wallets#keeping-the-spend-key-out-of-the-sdk) that produces signatures
+in your own backend. Passing a signer to `fromRootSecret` or `fromMnemonic` is not enough: those derive
+the spend key from the secret first. The SDK zeroes that copy at once, but it was in memory. Either
+way, the SDK checks that the signer holds the wallet's spending key, and checks every signature it
+returns before proving with it; a mismatch is a `SignerContractViolationError`.
+
+A signer may also implement `dispose()` to release held key material when it is no longer needed.
+`wallet.dispose()` and `sdk.close()` dispose the signer the SDK made for a wallet (a signer you passed
+in is yours to dispose) and wipe the wallet's viewing key. The default `LocalSigner` holds the only
+copy of the spend key, so disposing it wipes the key.
+
+Key wiping is best-effort. JavaScript can't wipe strings or bigints: the nullifying key is a bigint,
+the root secret you pass in is yours to wipe, and the engine's key derivation and signing make
+temporary hex-string copies of key material that stay in memory until garbage collection. Treat
+wiping as reducing exposure, not as a guarantee that no copy remains.

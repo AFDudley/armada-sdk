@@ -2,7 +2,7 @@
 // ABOUTME: identity/durable key prefixes that survive resetChainState. One source for every adapter.
 
 import type { StorageNamespace } from './index';
-import { StorageConflictError } from '../errors';
+import { InstanceClosedError, StorageConflictError } from '../errors';
 
 // Chain-derived state (merkle, TXOs, scan checkpoints) lives outside these prefixes and is wiped by
 // resetChainState. `identity/` holds wallet-identity records; `durable/` holds other rootSecret-scoped
@@ -36,6 +36,11 @@ export function assertSameBinding(adapter: string, bound: Uint8Array | undefined
   throw new StorageConflictError(
     `${adapter}: already open under another deployment namespace; close it (or use a separate store) before opening another`,
   );
+}
+
+/** Throw `InstanceClosedError` for a call on a closed adapter (one that hasn't been opened again since). */
+export function assertNotClosed(adapter: string, closed: boolean): void {
+  if (closed) throw new InstanceClosedError(`${adapter}: used after close() (open() it again first)`);
 }
 
 export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
