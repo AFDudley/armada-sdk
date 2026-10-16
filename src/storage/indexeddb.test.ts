@@ -14,6 +14,9 @@ const ns = (deployBlock: number): { schemaVersion: number; chainId: number; pool
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s)
 const dec = (b: Uint8Array | undefined): string | undefined => (b === undefined ? undefined : new TextDecoder().decode(b))
 
+// Node has no Web Locks API: a test harness opts out of the exclusive lock (the adapter fails closed otherwise).
+const HARNESS = { dangerouslySkipLock: true }
+
 let counter = 0
 const freshName = (): string => `test-db-${(counter += 1)}`
 
@@ -25,7 +28,7 @@ async function drain(store: IndexedDBStorageAdapter, prefix: string): Promise<Ar
 
 describe('IndexedDBStorageAdapter', () => {
   it('round-trips put/get/del', async () => {
-    const store = new IndexedDBStorageAdapter(freshName())
+    const store = new IndexedDBStorageAdapter(freshName(), HARNESS)
     await store.open(ns(0))
     await store.put('chain/a', enc('alpha'))
     expect(dec(await store.get('chain/a'))).toBe('alpha')
@@ -36,7 +39,7 @@ describe('IndexedDBStorageAdapter', () => {
   })
 
   it('lists entries under a prefix, key-ordered, excluding others', async () => {
-    const store = new IndexedDBStorageAdapter(freshName())
+    const store = new IndexedDBStorageAdapter(freshName(), HARNESS)
     await store.open(ns(0))
     await store.put('chain/2', enc('b'))
     await store.put('chain/1', enc('a'))
@@ -49,7 +52,7 @@ describe('IndexedDBStorageAdapter', () => {
   })
 
   it('resetChainState wipes chain-derived keys but preserves identity/*', async () => {
-    const store = new IndexedDBStorageAdapter(freshName())
+    const store = new IndexedDBStorageAdapter(freshName(), HARNESS)
     await store.open(ns(0))
     await store.put('identity/wallet', enc('keep'))
     await store.put('chain/scan-state', enc('drop'))
@@ -61,14 +64,14 @@ describe('IndexedDBStorageAdapter', () => {
 
   it('open under a changed deployment resets chain state (identity preserved)', async () => {
     const name = freshName()
-    const store = new IndexedDBStorageAdapter(name)
+    const store = new IndexedDBStorageAdapter(name, HARNESS)
     await store.open(ns(100))
     await store.put('identity/wallet', enc('keep'))
     await store.put('chain/scan-state', enc('drop'))
     await store.close()
 
     // Reopen the SAME db under a different deployBlock → namespace mismatch → chain reset.
-    const reopened = new IndexedDBStorageAdapter(name)
+    const reopened = new IndexedDBStorageAdapter(name, HARNESS)
     await reopened.open(ns(200))
     expect(dec(await reopened.get('identity/wallet'))).toBe('keep')
     expect(await reopened.get('chain/scan-state')).toBeUndefined()
@@ -77,12 +80,12 @@ describe('IndexedDBStorageAdapter', () => {
 
   it('persists across close + reopen (same db, same namespace)', async () => {
     const name = freshName()
-    const a = new IndexedDBStorageAdapter(name)
+    const a = new IndexedDBStorageAdapter(name, HARNESS)
     await a.open(ns(0))
     await a.put('chain/x', enc('persisted'))
     await a.close()
 
-    const b = new IndexedDBStorageAdapter(name)
+    const b = new IndexedDBStorageAdapter(name, HARNESS)
     await b.open(ns(0))
     expect(dec(await b.get('chain/x'))).toBe('persisted')
     await b.close()

@@ -13,6 +13,16 @@ export interface StorageNamespace {
   readonly deployBlock: number;
 }
 
+/** One write in an atomic `batch`. */
+export type StorageOp =
+  | { readonly type: 'put'; readonly key: string; readonly value: Uint8Array }
+  | { readonly type: 'del'; readonly key: string };
+
+/** `durable: true` asks the backend to commit to disk before resolving (IndexedDB `strict`, Level `sync`). */
+export interface StorageWriteOptions {
+  readonly durable?: boolean;
+}
+
 /**
  * Raw environment KV. The SDK provides `IndexedDBStorageAdapter` (browser) and a
  * `classic-level` adapter (node). Higher layers wrap this with encryption + schema versioning;
@@ -23,12 +33,26 @@ export interface StorageAdapter {
   /**
    * Bind the store to `namespace`. Returns `{ reset: true }` when a namespace mismatch (a redeploy under
    * a preserved identity) triggered a chain-state reset, so the instance can surface it as telemetry.
+   * Opening an already-open adapter under a DIFFERENT namespace throws `StorageConflictError` (it would wipe
+   * the chain state of whoever is using it); the same namespace again is a no-op.
    */
   open(namespace: StorageNamespace): Promise<{ reset: boolean }>;
   get(key: string): Promise<Uint8Array | undefined>;
   put(key: string, value: Uint8Array): Promise<void>;
   del(key: string): Promise<void>;
-  /** Iterate entries whose key starts with `prefix` (ordered). */
+  /**
+   * Atomic read-modify-write: `fn` gets the current value (or `undefined`) and returns the new one (`undefined`
+   * deletes the record). Atomic with respect to every other write to this adapter. `fn` MUST be synchronous: an
+   * IndexedDB transaction commits as soon as it awaits anything else. Resolves to the value stored.
+   */
+  update(
+    key: string,
+    fn: (current: Uint8Array | undefined) => Uint8Array | undefined,
+    options?: StorageWriteOptions,
+  ): Promise<Uint8Array | undefined>;
+  /** Apply `ops` in order as one atomic write: all of them land, or none do. */
+  batch(ops: readonly StorageOp[], options?: StorageWriteOptions): Promise<void>;
+  /** Iterate entries whose key starts with `prefix`, in key order. */
   list(prefix: string): AsyncIterable<{ key: string; value: Uint8Array }>;
   /** Targeted reset of chain-derived namespaces, preserving identity records. */
   resetChainState(): Promise<void>;

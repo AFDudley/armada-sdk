@@ -2,8 +2,8 @@
 // ABOUTME: memory-level in tests). The consumer brings the DB, so the SDK stays browser-safe + dep-free.
 
 import { StorageConflictError } from '../errors';
-import type { StorageAdapter, StorageNamespace } from './index';
-import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual } from './namespace';
+import type { StorageAdapter, StorageNamespace, StorageOp, StorageWriteOptions } from './index';
+import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding } from './namespace';
 
 /**
  * The minimal `abstract-level` surface `LevelStorageAdapter` needs. `classic-level` (Node LevelDB),
@@ -19,36 +19,67 @@ export interface AbstractLevelLike {
   get(key: string, options?: object): Promise<Uint8Array | undefined>;
   put(key: string, value: Uint8Array, options?: object): Promise<void>;
   del(key: string, options?: object): Promise<void>;
+  batch(
+    ops: Array<{ type: 'put'; key: string; value: Uint8Array } | { type: 'del'; key: string }>,
+    options?: object,
+  ): Promise<void>;
   iterator(options?: object): { all(): Promise<[string, Uint8Array][]> };
 }
 
 // Force binary keys/values per call, so the adapter works regardless of the DB's default encoding.
 const ENC = { keyEncoding: 'utf8', valueEncoding: 'view' } as const;
 
-/** Node-persistent StorageAdapter over an abstract-level DB, with the shared namespace/reset semantics. */
+// Whether an open() failure is the on-disk lock another process holds. abstract-level 3.x wraps it: the thrown
+// error is LEVEL_DATABASE_NOT_OPEN, and its `cause` carries LEVEL_LOCKED (WS-4) — so walk the cause chain.
+function lockedCause(err: unknown): string | undefined {
+  for (let e: unknown = err; e !== undefined && e !== null; e = (e as { cause?: unknown }).cause) {
+    const code = (e as { code?: string }).code ?? '';
+    const message = e instanceof Error ? e.message : String(e);
+    if (/lock/i.test(code) || /lock/i.test(message)) return code || message;
+  }
+  return undefined;
+}
+
+/**
+ * Node-persistent StorageAdapter over an abstract-level DB, with the shared namespace/reset semantics. Writes run
+ * one at a time through an in-process queue, so `update` is atomic against every other write; the database's own
+ * on-disk lock keeps a second process out entirely.
+ */
 export class LevelStorageAdapter implements StorageAdapter {
+  // The namespace this adapter is open under, until close().
+  private bound: Uint8Array | undefined;
+  // The tail of the write queue: each write starts once the previous one has settled.
+  private writes: Promise<unknown> = Promise.resolve();
+
   constructor(private readonly db: AbstractLevelLike) {}
 
+  private serialized<T>(write: () => Promise<T>): Promise<T> {
+    const run = this.writes.then(write, write);
+    this.writes = run.catch(() => undefined);
+    return run;
+  }
+
   async open(namespace: StorageNamespace): Promise<{ reset: boolean }> {
+    const nsBytes = encodeNamespace(namespace);
+    if (assertSameBinding('LevelStorageAdapter', this.bound, nsBytes)) return { reset: false };
     if (this.db.status !== 'open') {
       try {
         await this.db.open();
       } catch (err) {
-        // classic-level locks its on-disk directory; a second process opening it throws a LEVEL_LOCKED
-        // error. Surface advisory-lock conflicts as the typed error (SPEC §4.3) rather than an opaque one.
-        const code = (err as { code?: string }).code ?? '';
-        const message = err instanceof Error ? err.message : String(err);
-        if (/lock/i.test(code) || /lock/i.test(message)) {
-          throw new StorageConflictError(`LevelStorageAdapter: database is locked by another process (${code || message})`);
+        // classic-level locks its on-disk directory; a second process opening it fails. Surface advisory-lock
+        // conflicts as the typed error (SPEC §4.3) rather than an opaque one.
+        const locked = lockedCause(err);
+        if (locked !== undefined) {
+          throw new StorageConflictError(`LevelStorageAdapter: database is locked by another process (${locked})`, { cause: err });
         }
         throw err;
       }
     }
-    const nsBytes = encodeNamespace(namespace);
     const previous = await this.get(NAMESPACE_KEY);
     const reset = previous !== undefined && !bytesEqual(previous, nsBytes);
     if (reset) await this.resetChainState();
     await this.put(NAMESPACE_KEY, nsBytes);
+    this.bound = nsBytes;
     return { reset };
   }
 
@@ -57,12 +88,36 @@ export class LevelStorageAdapter implements StorageAdapter {
     return v === undefined ? undefined : new Uint8Array(v);
   }
 
-  async put(key: string, value: Uint8Array): Promise<void> {
-    await this.db.put(key, value, ENC);
+  put(key: string, value: Uint8Array): Promise<void> {
+    return this.serialized(() => this.db.put(key, value, ENC));
   }
 
-  async del(key: string): Promise<void> {
-    await this.db.del(key, ENC);
+  del(key: string): Promise<void> {
+    return this.serialized(() => this.db.del(key, ENC));
+  }
+
+  update(
+    key: string,
+    fn: (current: Uint8Array | undefined) => Uint8Array | undefined,
+    options?: StorageWriteOptions,
+  ): Promise<Uint8Array | undefined> {
+    return this.serialized(async () => {
+      const current = await this.db.get(key, ENC);
+      const next = fn(current === undefined ? undefined : new Uint8Array(current));
+      const sync = { ...ENC, sync: options?.durable === true };
+      if (next === undefined) await this.db.del(key, sync);
+      else await this.db.put(key, next, sync);
+      return next;
+    });
+  }
+
+  batch(ops: readonly StorageOp[], options?: StorageWriteOptions): Promise<void> {
+    return this.serialized(() =>
+      this.db.batch(
+        ops.map((op) => (op.type === 'put' ? { type: 'put' as const, key: op.key, value: op.value } : { type: 'del' as const, key: op.key })),
+        { ...ENC, sync: options?.durable === true },
+      ),
+    );
   }
 
   async *list(prefix: string): AsyncIterable<{ key: string; value: Uint8Array }> {
@@ -72,14 +127,17 @@ export class LevelStorageAdapter implements StorageAdapter {
     for (const [key, value] of entries) yield { key, value: new Uint8Array(value) };
   }
 
-  async resetChainState(): Promise<void> {
-    const entries = await this.db.iterator(ENC).all();
-    for (const [key] of entries) {
-      if (!isPreserved(key)) await this.db.del(key, ENC);
-    }
+  resetChainState(): Promise<void> {
+    return this.serialized(async () => {
+      const entries = await this.db.iterator(ENC).all();
+      for (const [key] of entries) {
+        if (!isPreserved(key)) await this.db.del(key, ENC);
+      }
+    });
   }
 
   async close(): Promise<void> {
     if (this.db.status === 'open') await this.db.close();
+    this.bound = undefined;
   }
 }

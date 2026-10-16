@@ -209,6 +209,7 @@ describe('createArmadaSdk (§4.1)', () => {
     await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
     const recordId = walletRecordId((await deriveKeyset(seed(0x77))).viewingPrivateKey);
     await saveScanState(store, recordId, new WalletScanState(), 500); // pre-seed a checkpoint at block 500
+    await store.close(); // the SDK opens it itself, as a fresh instance would
 
     // Plaintext storage so the wallet reads the raw adapter we seeded (bypasses the per-wallet key).
     const sdk = await createArmadaSdk({ ...makeConfig(), storage: store, dangerouslyAllowPlaintextStorage: true });
@@ -222,6 +223,7 @@ describe('createArmadaSdk (§4.1)', () => {
     // store under deployBlock 1, then construct an instance at deployBlock 2 → mismatch → reset → emit.
     const store = new MemoryStorageAdapter();
     await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
+    await store.close();
     const events: { event: string; data: unknown }[] = [];
     const cfg: ArmadaSdkConfig = {
       ...makeConfig(),
@@ -652,6 +654,7 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
     );
     const state = WalletScanState.restore({ trees, txos, spent: [], unshields: [], sent: [] });
     await saveScanState(store, recordId, state, 500);
+    await store.close(); // the SDK opens it itself, as a fresh instance would
     const base = makeConfig();
     const sdk = await createArmadaSdk({
       ...base,

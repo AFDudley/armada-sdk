@@ -64,14 +64,13 @@ describe('IndexedDBStorageAdapter — exclusive-lock guard', () => {
     await b.close();
   });
 
-  it('skips the guard when navigator.locks is unavailable (older/test envs)', async () => {
+  it('fails closed when navigator.locks is unavailable, unless the harness opts out (WS-3)', async () => {
+    // WHY: without Web Locks there's no guard against a second instance corrupting shared scan state; it used to
+    // skip the lock silently. Now it refuses to open, and only an explicit, greppable opt-out runs unlocked.
     vi.stubGlobal('navigator', {}); // no `locks`
-    const a = new IndexedDBStorageAdapter('lock-db-5');
-    const b = new IndexedDBStorageAdapter('lock-db-5');
-    await a.open(ns);
-    // No Web Locks API → no guard; both open (documents the feature-detect fallback).
-    await expect(b.open(ns)).resolves.toEqual({ reset: false });
-    await a.close();
-    await b.close();
+    await expect(new IndexedDBStorageAdapter('lock-db-5').open(ns)).rejects.toBeInstanceOf(StorageConflictError);
+    const harness = new IndexedDBStorageAdapter('lock-db-5', { dangerouslySkipLock: true });
+    await expect(harness.open(ns)).resolves.toEqual({ reset: false });
+    await harness.close();
   });
 });

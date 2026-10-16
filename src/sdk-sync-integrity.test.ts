@@ -639,6 +639,7 @@ describe('API-2: a consumer telemetry sink can never break the SDK', () => {
   it('a sink that throws on the redeploy-reset event does not fail createArmadaSdk', async () => {
     const storage = new MemoryStorageAdapter();
     await storage.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 99 });
+    await storage.close();
     // Same store, different deployBlock → the SDK resets chain state and emits storage.chain-reset.
     await expect(createArmadaSdk(cfg({ storage, telemetry: throwingSink }))).resolves.toBeDefined();
   });
