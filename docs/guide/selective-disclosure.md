@@ -24,9 +24,10 @@ The checker verifies each hop on its own.
 | `H1` | address → note | The `Shield` event shows `npk`. The opening gives `random`; the checker confirms `npk == Poseidon(M, random)` and the commitment at the leaf. The EOA signs the statement. |
 | `H2` | note → spend | A disclosure proof links a published nullifier to the note's leaf, for `M`. The nullifier is in the `Nullified` event. |
 | `H3` | spend → output note | The opening gives the output note. The checker recomputes the commitment and compares it with the `Transact` event. |
-| `H4` | spend → channel | The deposit `adaptParams` equals `depositBinding(channelId, expectedHeld)`. The adjudicator emits `Deposited(channelId, asset, held)`. |
+| `H4` | spend → channel | The funding nullifier is in the deposit transaction's `Nullified` event. The deposit `adaptParams` equals `depositBinding(channelId, expectedHeld)`. The adjudicator emits `Deposited(channelId, asset, held)`. |
 | `H5` | channel → payout note | The finalized outcome has a `SHIELD` allocation to the payout `npk`. The pool `Shield` event shows the note. |
 | `H6` | note → address | `H2` for the spent note, plus the `Unshield` event to the recipient EOA. The recipient EOA signs the statement. |
+| `H7` | channel gain is attributed | The channel's co-signed states, from the state after the deposit to the finalized state. Required when the statement claims the channel's attribution (see D7). |
 
 `H2` is the only hop that uses the disclosure circuit. All other hops use data
 that is already public or that the wallet already holds.
@@ -57,6 +58,8 @@ verifier        : string      who the disclosure is for
 context         : string      the purpose
 issuedAt        : uint64      Unix seconds
 endpoints       : Endpoint[]  the public addresses, each with a role
+adjudicator     : address     the armada-nitro adjudicator (zero when no channel hop)
+attributions    : Attribution[] the channels whose gain the statement attributes (D7)
 hopsHash        : bytes32     keccak256 of the canonical hop list
 ```
 
@@ -103,6 +106,7 @@ endpointSignatures  one EIP-712 signature per endpoint EOA
 openings            the note openings (random, token, value, leaf)
 proofs              the Groth16 disclosure proofs + their public signals
 hops                the ordered hop list
+channelStates       co-signed channel states, only with an attribution claim (H7)
 ```
 
 Field elements are 0x-hex. Public signals are decimal strings, to match the
@@ -112,17 +116,55 @@ circuit's output. A Groth16 proof keeps the snarkjs coordinate form.
 
 A hop names the opening, the proof or the endpoint it uses. A note opening
 carries its leaf `(tree, position)`. `H1`, `H3` and `H5` confirm an opening
-against its `Shield` or `Transact` event. `H2` and `H6` confirm that a proof's
-`(treeNumber, leafIndex)` is the spent note's leaf, and that the nullifier is in
-the `Nullified` event. This separates the proof of ownership (the opening) from
-the proof of the spend (the disclosure proof).
+against its `Shield` or `Transact` event. `H2`, `H4` and `H6` confirm that a
+proof's `(treeNumber, leafIndex)` is the spent note's leaf, and that the
+nullifier is in the `Nullified` event of the hop's transaction. (`H4` adds this
+nullifier check so a prover cannot pair a proof for one of their own notes with
+another wallet's real `Deposited` event — the fix for review finding F1.) This
+separates the proof of ownership (the opening) from the proof of the spend (the
+disclosure proof).
 
-### D6 · The checker returns the first failing check by name
+### D6 · Every cited event must come from the statement's chain and contract
+
+The statement names one chain and one pool (the EIP-712 domain) and one
+adjudicator (a statement field). Every record the checker reads carries the
+emitting chain id and contract (`EventScope`). The checker accepts a pool event
+only from the pool, and a hub event only from the adjudicator, both on the
+statement's chain. A record from any other chain or contract fails with
+`event-chain-mismatch` or `event-contract-mismatch`. This closes review finding
+F3: a verifier whose chain source serves more than one deployment no longer
+accepts a package for the wrong deployment. The caller's decoder stamps the
+chain id and contract on each record.
+
+### D7 · A statement claims a channel attribution or claims none
+
+Without a claim, a verifier learns the deposit and payout amounts of a channel
+but not why they differ. An attribution states how the gain arose. The protocol
+has no optional evidence (ADR-0020 D20.5):
+
+- With a claim, the package carries the channel's co-signed states (`H7`), and
+  the statement names the user's channel participant address, which signs the
+  statement as an endpoint. The checker runs the five `H7` checks: the states'
+  fixed part gives the `H4` channel id; every state carries all participants'
+  signatures (the user's recovers by ECDSA to the named address, the hub's
+  passes EIP-1271 through the `hubSignatureValid` chain-source method); the turn
+  numbers increase; the first state allocates the `H4` deposit to the user; and
+  the last state's outcome equals the `H5` finalized outcome. The checker
+  reports each change to the user's allocation.
+- Without a claim, the checker reports only the amounts and rejects a package
+  that carries channel states anyway (`unexpected-channel-states`).
+
+The go-nitro channel id, state hash and signature encoding match
+`armada-nitro/src/nitro/libraries/NitroUtils.sol` (`src/disclosure/nitro.ts`),
+proven against vectors from those contracts (`test/vectors/nitro-state-vectors.json`).
+
+### D8 · The checker returns the first failing check by name
 
 `checkDisclosurePackage` returns a typed result. On failure it names one check
-(for example `opening-npk`, `deposit-binding`, `nullifier-event`) and the hop
-index. On success it returns what the verifier learns: `masterPublicKey`, the
-endpoints, the transaction ids and the channel ids.
+(for example `opening-npk`, `deposit-binding`, `nullifier-event`,
+`event-contract-mismatch`, `attribution-first-state`) and the hop index. On
+success it returns what the verifier learns: `masterPublicKey`, the endpoints,
+the transaction ids, the channel ids and the attributed allocation changes.
 
 ## Build a package
 
