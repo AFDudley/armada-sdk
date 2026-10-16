@@ -239,6 +239,10 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         if (proof === undefined) return failure('hop-reference', `H4 references unknown proof "${hop.proof}"`, i);
         const proofErr = await verifyProof(proof, i);
         if (proofErr !== null) return proofErr;
+        // The funding spend must publish its nullifier in the deposit transaction. Without this check a
+        // prover pairs a proof for any of their own notes with another wallet's real Deposited event.
+        const nullErr = checkNullifierEvent(proof, hop.depositTxid, i);
+        if (nullErr !== null) return nullErr;
         const deposit = params.source
           .depositsIn(hop.depositTxid)
           .find((d) => addressesEqual(d.channelId, hop.channelId));

@@ -335,3 +335,38 @@ describe('selective disclosure — H3 output-note opening (ADR-0020)', () => {
     expect((await check(minimal, bad)).failure?.check).toBe('transact-commitment');
   }, 60_000);
 });
+
+describe('selective disclosure — H4 funding nullifier (F1 regression, ADR-0020)', () => {
+  // An H4 hop with NO paired H2 hop and NO Nullified event. The checker must tie the disclosed
+  // proof's nullifier to the deposit transaction; otherwise a prover claims another wallet's deposit.
+  it('rejects an H4 deposit whose funding nullifier is not in the deposit transaction', async () => {
+    const minimal = await buildDisclosurePackage({
+      keyset: keys,
+      domain,
+      verifier: 'v',
+      context: 'f1-h4',
+      issuedAt: 1_700_000_000,
+      endpoints: [],
+      openings: [{ label: 'N1', random: R1, token: usdc, value: V1, tree: 0, position: 5 }],
+      spends: [{ id: 'n1', opening: 'N1' }],
+      hops: [{ kind: 'H4', proof: 'n1', channelId: CHANNEL, expectedHeld: V1.toString(), asset: USDC, depositTxid: TX.deposit }],
+      prover,
+      artifacts,
+      signEndpoint: signerFor([]),
+    });
+    const adaptParams = keccak256(AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [CHANNEL, V1]));
+    const deposit = { txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams };
+    const nullifier1 = poseidon([keys.nullifyingKey, 5n]);
+
+    // No Nullified event: the funding nullifier was never published in the deposit transaction.
+    const noNullifier: DisclosureChainData = { deposits: [deposit], nullifiers: [] };
+    expect((await check(minimal, noNullifier)).failure?.check).toBe('nullifier-event');
+
+    // With the funding nullifier present, the same package passes.
+    const withNullifier: DisclosureChainData = {
+      deposits: [deposit],
+      nullifiers: [{ tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }],
+    };
+    expect((await check(minimal, withNullifier)).ok).toBe(true);
+  }, 60_000);
+});
