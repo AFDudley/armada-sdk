@@ -1,6 +1,6 @@
 {
   "_provenance": {
-    "source": "forge vectors produced by armada-nitro/.scratch/NitroVectors.s.sol (scratch, not committed)",
+    "source": "test/vectors/tools/NitroVectors.s.sol (forge script); run it in an armada-nitro checkout as test/vectors/tools/README.md describes",
     "contracts": "src/nitro/libraries/NitroUtils.sol (getChannelId, hashState, prefixedHash, recoverSigner), lib/exit-format/contracts/ExitFormat.sol",
     "armada_nitro_commit": "edc1de96ba81e674dabe3ff737756c261f9996d6",
     "note": "Values computed by the go-nitro Solidity contracts, not by armada-sdk. src/disclosure/nitro.test.ts recomputes them in TypeScript and asserts equality."
