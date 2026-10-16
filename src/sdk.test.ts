@@ -829,6 +829,28 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
     });
   });
 
+  describe('an in-proof fee is USDC-only (#115)', () => {
+    // WHY: the fee note is minted in the spent token, so a fee on a shares (or any non-USDC) spend paid the relayer
+    // in shares, which it doesn't count: the relayer rejected the spend after the proof (FEE_INSUFFICIENT). A yield
+    // redeem's fee is already paid contract-side in USDC, so a fee there charged the user twice.
+    const SHARES = `0x${'5e'.repeat(20)}` as const;
+
+    it('rejects a non-USDC spend that carries a fee, pointing at the paths that pay the relayer in USDC', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] });
+      const request = { outputs: [], unshield: { recipient: `0x${'ab'.repeat(20)}` as const, amount: 5n }, tokenAddress: SHARES, fee: FEE };
+      await expect(wallet.planTransfer(request)).rejects.toThrow(/fee .*USDC/);
+      await expect(wallet.maxUnshieldAmount({ fee: FEE, tokenAddress: SHARES })).rejects.toBeInstanceOf(InvalidRequestError);
+      await sdk.close();
+    });
+
+    it('still plans a non-USDC spend with no fee (e.g. a yield redeem, paid contract-side)', async () => {
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] }); // USDC notes only, so planning finds no shares
+      const request = { outputs: [], unshield: { recipient: `0x${'ab'.repeat(20)}` as const, amount: 5n }, tokenAddress: SHARES };
+      await expect(wallet.planTransfer(request)).rejects.toThrow(/no single tree covers/); // past the fee guard
+      await sdk.close();
+    });
+  });
+
   describe('fee input (#121)', () => {
     it('with no fee, a plan carries no fee note (e.g. a yield redeem paid contract-side, or self-submission)', async () => {
       const { sdk, wallet } = await walletWithNotes({ 0: [20n] });

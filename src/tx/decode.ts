@@ -149,9 +149,11 @@ export function decodeTransact(calldata: string): DecodedTransact[] {
 /**
  * Recover the in-band fee note addressed to `broadcaster` from a decoded transaction, or `undefined`
  * if none. Trial-decrypts each output ciphertext with the broadcaster identity, then BINDS the result:
- * the decrypted note's commitment hash must appear in `decoded.commitments`. Without that binding a
- * sender could attach a ciphertext claiming any fee value while the real commitment encodes something
- * else (or is addressed elsewhere) — so the value is only trusted once its commitment is confirmed.
+ * the decrypted note's commitment hash must equal the commitment at the SAME index as its ciphertext
+ * (`commitmentCiphertexts[i]` ↔ `commitments[i]`). Without that binding a sender could attach a ciphertext
+ * claiming any fee value while the real commitment encodes something else (or is addressed elsewhere) —
+ * and the index matters because the broadcaster's own scanner pairs them by index: a fee note whose
+ * ciphertext sits at another commitment's index is never discovered, so the relayer would never be paid.
  */
 export async function extractFeeOutput(
   decoded: DecodedTransact,
@@ -160,14 +162,13 @@ export async function extractFeeOutput(
   chain?: Chain,
   expected?: { readonly tokenAddress?: `0x${string}`; readonly minValue?: bigint },
 ): Promise<{ tokenAddress: `0x${string}`; value: bigint } | undefined> {
-  const commitmentSet = new Set(decoded.commitments.map((c) => c.toString()));
-  for (const ciphertext of decoded.commitmentCiphertexts) {
+  for (const [i, ciphertext] of decoded.commitmentCiphertexts.entries()) {
     const note = chain
       ? await tryDecryptCommitment(ciphertext, broadcaster, tokenDataGetter, chain)
       : await tryDecryptCommitment(ciphertext, broadcaster, tokenDataGetter);
     if (note === undefined) continue;
-    // Binding check: the note we decrypted must correspond to an actual on-chain commitment.
-    if (!commitmentSet.has(note.hash.toString())) continue;
+    // Binding check: the note we decrypted must be the commitment at its own index (TX-5).
+    if (note.hash !== decoded.commitments[i]) continue;
     const tokenAddress = note.tokenData.tokenAddress as `0x${string}`;
     // Optional relayer-side guard: only accept a fee in the expected token AND at least the advertised
     // amount, so a call site can't forget the comparison (a fee note in the wrong token or underpaid is

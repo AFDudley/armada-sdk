@@ -1028,9 +1028,25 @@ class ArmadaWallet implements Wallet {
     }
   }
 
+  /**
+   * An in-proof fee note is minted in the spent token, and the relayer only counts USDC (#115). So reject a fee on
+   * any other token's spend rather than plan one the relayer refuses after proving. A yield redeem pays its fee
+   * contract-side (omit `fee`); `consolidate` pays a non-USDC merge's fee from a separate USDC group.
+   */
+  private assertUsdcFee(request: PlanTransferRequest): void {
+    if (request.fee === undefined || request.fee.perProof <= 0n) return;
+    if ((request.tokenAddress ?? this.ctx.usdcAddress).toLowerCase() === this.ctx.usdcAddress.toLowerCase()) return;
+    throw new InvalidRequestError(
+      'a non-USDC spend can\'t carry an in-proof fee: the fee note is paid in the spent token and the relayer only ' +
+        'counts USDC. A yield redeem pays its fee contract-side (omit `fee`); merge non-USDC notes with consolidate, ' +
+        'which pays the fee from a separate USDC group.',
+    );
+  }
+
   // The planner request for a transfer/unshield over `txos`.
   private spendParams(request: PlanTransferRequest, txos: readonly TXO[], roots: ReadonlyMap<number, bigint>): PlanTransferParams {
     this.assertCrossChainUnshield(request);
+    this.assertUsdcFee(request);
     // The caller's fee is PER PROOF: a split spend pays it once per group (planSpend scales it). No fee
     // (or zero) means no fee note.
     const fee = request.fee;

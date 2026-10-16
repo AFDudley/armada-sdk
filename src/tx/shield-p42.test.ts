@@ -8,9 +8,11 @@ import { deriveKeyset } from '../wallet/derive';
 import {
   buildShieldIntentTypedData, buildGaslessShield, buildPermitTypedData, hashPermit,
 } from './gasless-shield';
-import { buildGaslessCrossChainShield, hashShieldData, hashCrossChainShieldIntent } from './gasless-cross-chain-shield';
-import { shieldNet } from './shield-fee';
-import { generateShieldPrivateKey } from './shield';
+import {
+  buildGaslessCrossChainShield, hashShieldData, hashCrossChainShieldIntent, buildCrossChainShieldIntentTypedData, shieldDataFromRequest,
+} from './gasless-cross-chain-shield';
+import { reconstructShieldNpk, shieldNet } from './shield-fee';
+import { buildShieldRequest, generateShieldPrivateKey } from './shield';
 
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const addr = (p: string): `0x${string}` => `0x${p.repeat(20)}`;
@@ -76,5 +78,38 @@ describe('fee-note gross-up wiring + cross-chain builder (P4.2)', () => {
     expect(feeNote.value).toBeGreaterThan(5000n);
     expect(feeNote.npk).not.toBe(userNote.npk);
     expect(feeNote.encryptedBundle).toHaveLength(3);
+  });
+
+  it('returns both note randoms, and is the composition of the staged pieces (#115)', async () => {
+    // WHY: the relayer needs `feeRandom` to rebuild the fee note's npk; and a save-and-resume flow builds the notes,
+    // persists them, then builds the intent later — so the staged pieces must produce exactly what the all-in-one does.
+    const relayer = await deriveKeyset(seed(0x33));
+    const user = await deriveKeyset(seed(0x22));
+    const input = {
+      clientWrapperAddress: addr('55'), chainId: 31337, user: addr('22'), maxFee: 100n, minFinalityThreshold: 1000, deadline: 7n, nonce: 2n,
+      userShield: { shieldedAddress: user.shieldedAddress, amount: 1_000_000n, tokenAddress: USDC, integrator: addr('00') },
+      feeShield: { shieldedAddress: relayer.shieldedAddress, amount: 5000n, tokenAddress: USDC, integrator: addr('00') },
+    };
+    const key = generateShieldPrivateKey();
+    const built = await buildGaslessCrossChainShield(input, key);
+    expect(BigInt(built.feeNote.npk)).toBe(reconstructShieldNpk(relayer.masterPublicKey, built.feeRandom));
+    expect(BigInt(built.userNote.npk)).toBe(reconstructShieldNpk(user.masterPublicKey, built.userRandom));
+
+    // Staged: build a note with the same random and convert it. The npk, value and integrator match; the ciphertext
+    // doesn't, because shield encryption draws fresh randomness each time.
+    const userReq = await buildShieldRequest(input.userShield, key, built.userRandom);
+    const userNote = shieldDataFromRequest(userReq.shieldRequest, input.userShield.integrator);
+    expect({ npk: userNote.npk, value: userNote.value, integrator: userNote.integrator })
+      .toEqual({ npk: built.userNote.npk, value: built.userNote.value, integrator: built.userNote.integrator });
+    // The intent built on its own from the saved notes is exactly the all-in-one's.
+    const typedData = buildCrossChainShieldIntentTypedData({
+      clientWrapperAddress: input.clientWrapperAddress,
+      chainId: input.chainId,
+      intent: {
+        user: input.user, userNoteHash: hashShieldData(built.userNote), feeNoteHash: hashShieldData(built.feeNote),
+        maxFee: input.maxFee, minFinalityThreshold: input.minFinalityThreshold, deadline: input.deadline, nonce: input.nonce,
+      },
+    });
+    expect(hashCrossChainShieldIntent(typedData)).toBe(hashCrossChainShieldIntent(built.typedData));
   });
 });

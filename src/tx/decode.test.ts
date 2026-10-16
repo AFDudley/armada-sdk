@@ -180,6 +180,22 @@ describe('decodeTransact (§4.6)', () => {
     expect(await extractFeeOutput(decoded!, rk(broadcaster), tokenGetter())).toBeUndefined();
   });
 
+  it('extractFeeOutput binds the fee note to the commitment at its own ciphertext index (TX-5)', async () => {
+    // WHY: the broadcaster's scanner pairs ciphertext[i] with commitments[i]. A sender who swaps the ciphertexts
+    // ([fee, pay] commitments, [pay, fee] ciphertexts) still passed a "commitment appears somewhere" check, yet
+    // the relayer's scanner never finds the fee note — the relayer relays for nothing.
+    const feeNote = await makeCommitment(5_000n, broadcaster);
+    const pay = await makeCommitment(3n, receiver);
+    const swapped = buildCalldata([feeNote.note.hash, pay.note.hash], [pay.ct, feeNote.ct]);
+    const [decodedSwapped] = decodeTransact(swapped);
+    expect(await extractFeeOutput(decodedSwapped!, rk(broadcaster), tokenGetter())).toBeUndefined();
+
+    // A fee note correctly paired at a later index is still found.
+    const aligned = buildCalldata([pay.note.hash, feeNote.note.hash], [pay.ct, feeNote.ct]);
+    const [decodedAligned] = decodeTransact(aligned);
+    expect(await extractFeeOutput(decodedAligned!, rk(broadcaster), tokenGetter())).toEqual({ tokenAddress: USDC, value: 5_000n });
+  });
+
   it('extractFeeOutput enforces the optional expected token + minimum value (P3.7 guard)', async () => {
     // WHY: a relayer verifies the fee note is in the right token AND ≥ the advertised amount. Passing
     // `expected` makes the SDK do the comparison so the call site can't forget it.

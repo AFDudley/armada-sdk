@@ -585,7 +585,8 @@ const tx = buildTransactCalldata(handles.map((h) => h.toTransactionData()), pool
   `adaptContract`, or has `maxFee >= value`.
 - **Decode API for verifiers.** The pure `decodeTransact(calldata)` understands both bare
   `transact()` and the wrapper entry points natively, and `extractFeeOutput(decoded, broadcasterKeys,
-  tokenDataGetter)` recovers the broadcaster fee note (bound to its commitment). Both are plain
+  tokenDataGetter)` recovers the broadcaster fee note, bound to the commitment at its
+  ciphertext's own index (the index the broadcaster's scanner uses to find it). Both are plain
   functions (no SDK instance needed), replacing the relayer's synthetic-calldata normalization in
   `broadcaster-fee-verifier.ts` with a supported API. For the shield path, the SDK provides
   the **npk-reconstruction fee verification** primitive (per #410's v1 relayer): given a
@@ -600,7 +601,14 @@ const tx = buildTransactCalldata(handles.map((h) => h.toTransactionData()), pool
     note, integrator), enabling any-relayer submission with nothing alterable in transit;
   - the **permit-based gasless path** (token permit + intent, no user gas);
   - the **cross-chain variant** — fee note carried across CCTP and minted on the hub, with
-    the multi-note mint batched into a single `Shield` event.
+    the multi-note mint batched into a single `Shield` event;
+  - **what a consumer needs end to end** (#115):
+    - the builders return each note's `random`, which the relayer needs to rebuild its fee note's npk
+      (`verifyShieldFeeNote` / `reconstructShieldNpk`);
+    - `buildGaslessShieldCalldata` / `buildGaslessCrossChainShieldCalldata` encode the wrapper calls, and
+      `decodeGaslessShieldCalldata` / `decodeGaslessCrossChainShieldCalldata` let the relayer read them back;
+    - staged pieces (`buildShieldRequest`, `shieldDataFromRequest`, `buildShieldIntentTypedData`,
+      `buildCrossChainShieldIntentTypedData`) support a save-and-resume signing flow.
 
 #### 4.6.1 Fee binding
 

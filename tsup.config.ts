@@ -65,6 +65,12 @@ export default defineConfig([
     sourcemap: true,
     target: 'es2022',
     external: ['snarkjs', 'node:fs/promises', 'node:path'],
+    // The bundled `process` polyfill (@jspm/core) reads `navigator.language` when it loads, which throws in
+    // Node < 21 (no `navigator` global) and made the ESM build unimportable there (#131). Its only use is a
+    // locale for `process.env.LANG`, so fix it at build time.
+    esbuildOptions(options) {
+      options.define = { ...options.define, 'navigator.language': '"en-US"' }
+    },
     // tsup externalizes package `dependencies` by default; force the crypto/serialization deps to be
     // bundled so none survive as a `__require` shim. (ethers is bundled too — self-contained browser SDK.)
     noExternal: [
