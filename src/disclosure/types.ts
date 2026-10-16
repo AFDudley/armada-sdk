@@ -47,6 +47,8 @@ export interface DisclosureStatement {
   /** Unix seconds (EIP-712 `uint64`). */
   readonly issuedAt: number;
   readonly endpoints: readonly DisclosureEndpoint[];
+  /** The armada-nitro adjudicator address (EIP-712 `address`); the zero address when no channel hop. */
+  readonly adjudicator: string;
   /** `keccak256` of the canonical hop list (EIP-712 `bytes32`, 0x-prefixed). */
   readonly hopsHash: string;
 }

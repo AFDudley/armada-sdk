@@ -29,6 +29,7 @@ function makeStatement(account: string): DisclosureStatement {
     context: 'source-of-funds for withdrawal 0xbb',
     issuedAt: 1_700_000_000,
     endpoints: [{ role: 'shielder', account }],
+    adjudicator: `0x${'00'.repeat(20)}`,
     hopsHash: hashHops(hops),
   };
 }

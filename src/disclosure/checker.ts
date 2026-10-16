@@ -5,7 +5,7 @@ import { AbiCoder, keccak256, getAddress } from 'ethers';
 import { ShieldNote, getTokenDataHash } from '../core/index';
 import type { ProverAdapter } from '../prover/index';
 import { hashHops, statementHashField, verifyEndpointSignature } from './statement';
-import type { DisclosureChainSource } from './chain-source';
+import type { DisclosureChainSource, EventScope } from './chain-source';
 import {
   DISCLOSURE_PACKAGE_VERSION,
   SHIELD_ALLOCATION_TYPE,
@@ -35,7 +35,10 @@ export type DisclosureCheckName =
   | 'deposit-binding'
   | 'deposited-event'
   | 'finalized-shield-allocation'
-  | 'unshield-event';
+  | 'unshield-event'
+  | 'event-chain-mismatch'
+  | 'event-contract-mismatch'
+  | 'missing-adjudicator';
 
 export interface DisclosureCheckFailure {
   readonly check: DisclosureCheckName;
@@ -108,6 +111,28 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
   const endpointByRole = new Map(pkg.statement.endpoints.map((e) => [e.role, e]));
   const verifiedProofs = new Set<string>();
 
+  // Chain scope (ADR-0020 D20.6). The statement names one chain (the domain), one pool (the domain's
+  // verifyingContract) and one adjudicator; the checker accepts an event only from those.
+  const expectedChainId = pkg.domain.chainId;
+  const poolContract = pkg.domain.verifyingContract;
+  const adjudicator = pkg.statement.adjudicator;
+
+  // True when an event's scope is the statement's chain and the given contract.
+  const inScope = (scope: EventScope, contract: string): boolean =>
+    scope.chainId === expectedChainId && addressesEqual(scope.contract, contract);
+
+  // Report the first way a scope differs from the statement's chain and the expected contract.
+  const scopeFailure = (scope: EventScope, contract: string, hopIndex: number): DisclosureCheckResult => {
+    if (scope.chainId !== expectedChainId) {
+      return failure('event-chain-mismatch', `event chain ${scope.chainId} is not the statement's chain ${expectedChainId}`, hopIndex);
+    }
+    return failure('event-contract-mismatch', `event contract ${scope.contract} is not ${contract}`, hopIndex);
+  };
+
+  // A channel hop (H4, H5, H7) requires the statement to name a non-zero adjudicator.
+  const requireAdjudicator = (hopIndex: number): DisclosureCheckResult | null =>
+    BigInt(adjudicator) === 0n ? failure('missing-adjudicator', 'statement names no adjudicator for a channel hop', hopIndex) : null;
+
   // Verify one proof: its public statement hash and masterPublicKey must match the statement, and the
   // Groth16 proof must verify against the disclosure vkey. Cached so a shared proof verifies once.
   const verifyProof = async (entry: DisclosureProofEntry, hopIndex: number): Promise<DisclosureCheckResult | null> => {
@@ -158,11 +183,15 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
     if (opening.tree !== loc.tree || opening.position !== loc.position) {
       return failure('shield-commitment', `opening "${opening.label}" position does not match hop shield location`, hopIndex);
     }
-    const record = params.source
+    const candidates = params.source
       .shieldsIn(loc.txid)
-      .find((s) => s.tree === loc.tree && s.position === loc.position);
-    if (record === undefined) {
+      .filter((s) => s.tree === loc.tree && s.position === loc.position);
+    if (candidates.length === 0) {
       return failure('shield-commitment', `no Shield commitment at (${loc.txid}, tree ${loc.tree}, position ${loc.position})`, hopIndex);
+    }
+    const record = candidates.find((s) => inScope(s, poolContract));
+    if (record === undefined) {
+      return scopeFailure(candidates[0]!, poolContract, hopIndex);
     }
     if (BigInt(`0x${record.hash}`) !== commitmentHash(opening)) {
       return failure('shield-commitment', `Shield commitment at (${loc.txid}) does not match the opened note`, hopIndex);
@@ -222,11 +251,15 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         if (opening.tree !== hop.transact.tree || opening.position !== hop.transact.position) {
           return failure('transact-commitment', `opening "${opening.label}" position does not match hop transact location`, i);
         }
-        const record = params.source
+        const transactCandidates = params.source
           .transactsIn(hop.transact.txid)
-          .find((t) => t.tree === hop.transact.tree && t.position === hop.transact.position);
-        if (record === undefined) {
+          .filter((t) => t.tree === hop.transact.tree && t.position === hop.transact.position);
+        if (transactCandidates.length === 0) {
           return failure('transact-commitment', `no Transact commitment at (${hop.transact.txid}, tree ${hop.transact.tree}, position ${hop.transact.position})`, i);
+        }
+        const record = transactCandidates.find((t) => inScope(t, poolContract));
+        if (record === undefined) {
+          return scopeFailure(transactCandidates[0]!, poolContract, i);
         }
         if (BigInt(`0x${record.hash}`) !== commitmentHash(opening)) {
           return failure('transact-commitment', `Transact commitment at (${hop.transact.txid}) does not match the opened note`, i);
@@ -243,11 +276,17 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         // prover pairs a proof for any of their own notes with another wallet's real Deposited event.
         const nullErr = checkNullifierEvent(proof, hop.depositTxid, i);
         if (nullErr !== null) return nullErr;
-        const deposit = params.source
+        const adjErr = requireAdjudicator(i);
+        if (adjErr !== null) return adjErr;
+        const depositCandidates = params.source
           .depositsIn(hop.depositTxid)
-          .find((d) => addressesEqual(d.channelId, hop.channelId));
-        if (deposit === undefined) {
+          .filter((d) => addressesEqual(d.channelId, hop.channelId));
+        if (depositCandidates.length === 0) {
           return failure('deposited-event', `no Deposited event for channel ${hop.channelId} in ${hop.depositTxid}`, i);
+        }
+        const deposit = depositCandidates.find((d) => inScope(d, adjudicator));
+        if (deposit === undefined) {
+          return scopeFailure(depositCandidates[0]!, adjudicator, i);
         }
         const binding = keccak256(AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [hop.channelId, BigInt(hop.expectedHeld)]));
         if (BigInt(deposit.adaptParams) !== BigInt(binding)) {
@@ -265,13 +304,22 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         if ('ok' in opening) return opening;
         const openErr = checkOpening(opening, i);
         if (openErr !== null) return openErr;
-        const outcome = params.source
+        const adjErr = requireAdjudicator(i);
+        if (adjErr !== null) return adjErr;
+        const outcomeCandidates = params.source
           .finalizedOutcomesIn(hop.concludeTxid)
-          .find((o) => addressesEqual(o.channelId, hop.channelId));
-        const paysNote = outcome?.allocations.some(
+          .filter((o) => addressesEqual(o.channelId, hop.channelId));
+        if (outcomeCandidates.length === 0) {
+          return failure('finalized-shield-allocation', `channel ${hop.channelId} has no finalized outcome in ${hop.concludeTxid}`, i);
+        }
+        const outcome = outcomeCandidates.find((o) => inScope(o, adjudicator));
+        if (outcome === undefined) {
+          return scopeFailure(outcomeCandidates[0]!, adjudicator, i);
+        }
+        const paysNote = outcome.allocations.some(
           (a) => a.allocationType === SHIELD_ALLOCATION_TYPE && BigInt(a.destination) === BigInt(opening.npk),
         );
-        if (outcome === undefined || paysNote !== true) {
+        if (paysNote !== true) {
           return failure('finalized-shield-allocation', `channel ${hop.channelId} has no SHIELD allocation to note "${opening.label}" in ${hop.concludeTxid}`, i);
         }
         const shieldErr = checkShieldLocation(opening, hop.shield, i);
@@ -294,9 +342,15 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         if (posErr !== null) return posErr;
         const nullErr = checkNullifierEvent(proof, hop.unshieldTxid, i);
         if (nullErr !== null) return nullErr;
-        const paidOut = params.source.unshieldsIn(hop.unshieldTxid).some((u) => addressesEqual(u.to, endpoint.account));
-        if (!paidOut) {
+        const unshieldCandidates = params.source
+          .unshieldsIn(hop.unshieldTxid)
+          .filter((u) => addressesEqual(u.to, endpoint.account));
+        if (unshieldCandidates.length === 0) {
           return failure('unshield-event', `no Unshield to ${endpoint.account} in ${hop.unshieldTxid}`, i);
+        }
+        const unshield = unshieldCandidates.find((u) => inScope(u, poolContract));
+        if (unshield === undefined) {
+          return scopeFailure(unshieldCandidates[0]!, poolContract, i);
         }
         transactionIds.add(hop.unshieldTxid);
         return null;
@@ -315,11 +369,15 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
 
   // The proof's nullifier must appear in the named transaction's Nullified event, in the proof's tree.
   function checkNullifierEvent(proof: DisclosureProofEntry, txid: string, hopIndex: number): DisclosureCheckResult | null {
-    const found = params.source
+    const candidates = params.source
       .nullifiersIn(txid)
-      .some((n) => n.tree === proof.treeNumber && n.nullifier === BigInt(proof.nullifier));
-    if (!found) {
+      .filter((n) => n.tree === proof.treeNumber && n.nullifier === BigInt(proof.nullifier));
+    if (candidates.length === 0) {
       return failure('nullifier-event', `nullifier of proof "${proof.id}" not in Nullified event of ${txid}`, hopIndex);
+    }
+    const record = candidates.find((n) => inScope(n, poolContract));
+    if (record === undefined) {
+      return scopeFailure(candidates[0]!, poolContract, hopIndex);
     }
     return null;
   }

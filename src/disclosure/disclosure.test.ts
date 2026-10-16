@@ -46,7 +46,12 @@ const artifactsDir =
   process.env.ARMADA_DISCLOSURE_ARTIFACTS ??
   fileURLToPath(new URL('../../../armada-circuits/build/disclosure', import.meta.url));
 
-const domain: DisclosureDomain = { chainId: 31337, verifyingContract: `0x${'11'.repeat(20)}` };
+const POOL = `0x${'11'.repeat(20)}`;
+const ADJUDICATOR = `0x${'ad'.repeat(20)}`;
+const CHAIN = 31337;
+const domain: DisclosureDomain = { chainId: CHAIN, verifyingContract: POOL };
+const poolScope = { chainId: CHAIN, contract: POOL } as const;
+const adjScope = { chainId: CHAIN, contract: ADJUDICATOR } as const;
 
 let prover: ProverAdapter;
 let artifacts: ArtifactSet;
@@ -128,6 +133,7 @@ beforeAll(async () => {
     verifier: 'Acme Exchange compliance',
     context: 'source-of-funds for USDC withdrawal to 0xB',
     issuedAt: 1_700_000_000,
+    adjudicator: ADJUDICATOR,
     endpoints: [
       { role: 'shielder', account: walletA.address },
       { role: 'withdrawer', account: walletB.address },
@@ -150,17 +156,17 @@ beforeAll(async () => {
 
   baseData = {
     shields: [
-      { tree: 0, position: 5, blockNumber: 100, txid: TX.shield, hash: commitment1.toString(16), npk: npk1.toString(16), tokenData: usdc, value: V1, encryptedBundle: ['00', '00', '00'], shieldKey: '00' },
-      { tree: 0, position: 9, blockNumber: 400, txid: TX.conclude, hash: commitment2.toString(16), npk: npk2.toString(16), tokenData: usdc, value: V2, encryptedBundle: ['00', '00', '00'], shieldKey: '00' },
+      { ...poolScope, tree: 0, position: 5, blockNumber: 100, txid: TX.shield, hash: commitment1.toString(16), npk: npk1.toString(16), tokenData: usdc, value: V1, encryptedBundle: ['00', '00', '00'], shieldKey: '00' },
+      { ...poolScope, tree: 0, position: 9, blockNumber: 400, txid: TX.conclude, hash: commitment2.toString(16), npk: npk2.toString(16), tokenData: usdc, value: V2, encryptedBundle: ['00', '00', '00'], shieldKey: '00' },
     ],
     nullifiers: [
-      { tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 200 },
-      { tree: 0, nullifier: nullifier2, txid: TX.unshield, blockNumber: 500 },
+      { ...poolScope, tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 200 },
+      { ...poolScope, tree: 0, nullifier: nullifier2, txid: TX.unshield, blockNumber: 500 },
     ],
-    unshields: [{ to: walletB.address, tokenData: usdc, amount: V2, fee: 0n, blockNumber: 500, txid: TX.unshield }],
-    deposits: [{ txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams }],
+    unshields: [{ ...poolScope, to: walletB.address, tokenData: usdc, amount: V2, fee: 0n, blockNumber: 500, txid: TX.unshield }],
+    deposits: [{ ...adjScope, txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams }],
     finalizedOutcomes: [
-      { txid: TX.conclude, channelId: CHANNEL, asset: USDC, allocations: [{ destination: `0x${npk2.toString(16)}`, amount: V2.toString(), allocationType: 3 }] },
+      { ...adjScope, txid: TX.conclude, channelId: CHANNEL, asset: USDC, allocations: [{ destination: `0x${npk2.toString(16)}`, amount: V2.toString(), allocationType: 3 }] },
     ],
     senders: { [TX.shield]: walletA.address },
   };
@@ -303,7 +309,7 @@ describe('selective disclosure — H2 spend-leaf linkage (ADR-0020)', () => {
       signEndpoint: signerFor([]),
     });
     const nullifier1 = poseidon([keys.nullifyingKey, 5n]);
-    const data: DisclosureChainData = { nullifiers: [{ tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }] };
+    const data: DisclosureChainData = { nullifiers: [{ ...poolScope, tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }] };
     expect((await check(minimal, data)).ok).toBe(true);
     const bad = { ...minimal, openings: minimal.openings.map((o) => ({ ...o, position: 6 })) };
     expect((await check(bad, data)).failure?.check).toBe('spend-leaf-position');
@@ -329,9 +335,9 @@ describe('selective disclosure — H3 output-note opening (ADR-0020)', () => {
     const npk3 = ShieldNote.getNotePublicKey(keys.masterPublicKey, R1);
     const commitment3 = ShieldNote.getShieldNoteHash(npk3, getTokenDataHash(usdc), V1);
     const ciphertext = { ciphertext: ['00', '00', '00', '00'], blindedSenderViewingKey: new Uint8Array(32), blindedReceiverViewingKey: new Uint8Array(32), memo: '', annotationData: '' };
-    const good: DisclosureChainData = { transacts: [{ tree: 0, position: 7, blockNumber: 1, txid: TX.conclude, hash: commitment3.toString(16), ciphertext }] };
+    const good: DisclosureChainData = { transacts: [{ ...poolScope, tree: 0, position: 7, blockNumber: 1, txid: TX.conclude, hash: commitment3.toString(16), ciphertext }] };
     expect((await check(minimal, good)).ok).toBe(true);
-    const bad: DisclosureChainData = { transacts: [{ tree: 0, position: 7, blockNumber: 1, txid: TX.conclude, hash: (commitment3 + 1n).toString(16), ciphertext }] };
+    const bad: DisclosureChainData = { transacts: [{ ...poolScope, tree: 0, position: 7, blockNumber: 1, txid: TX.conclude, hash: (commitment3 + 1n).toString(16), ciphertext }] };
     expect((await check(minimal, bad)).failure?.check).toBe('transact-commitment');
   }, 60_000);
 });
@@ -346,6 +352,7 @@ describe('selective disclosure — H4 funding nullifier (F1 regression, ADR-0020
       verifier: 'v',
       context: 'f1-h4',
       issuedAt: 1_700_000_000,
+      adjudicator: ADJUDICATOR,
       endpoints: [],
       openings: [{ label: 'N1', random: R1, token: usdc, value: V1, tree: 0, position: 5 }],
       spends: [{ id: 'n1', opening: 'N1' }],
@@ -355,7 +362,7 @@ describe('selective disclosure — H4 funding nullifier (F1 regression, ADR-0020
       signEndpoint: signerFor([]),
     });
     const adaptParams = keccak256(AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [CHANNEL, V1]));
-    const deposit = { txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams };
+    const deposit = { ...adjScope, txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams };
     const nullifier1 = poseidon([keys.nullifyingKey, 5n]);
 
     // No Nullified event: the funding nullifier was never published in the deposit transaction.
@@ -365,8 +372,51 @@ describe('selective disclosure — H4 funding nullifier (F1 regression, ADR-0020
     // With the funding nullifier present, the same package passes.
     const withNullifier: DisclosureChainData = {
       deposits: [deposit],
-      nullifiers: [{ tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }],
+      nullifiers: [{ ...poolScope, tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }],
     };
     expect((await check(minimal, withNullifier)).ok).toBe(true);
+  }, 60_000);
+});
+
+describe('selective disclosure — chain scope (F3 regression, D20.6)', () => {
+  const WRONG_CONTRACT = `0x${'99'.repeat(20)}`;
+
+  it('rejects an event from a different chain', async () => {
+    const data = { ...baseData, nullifiers: baseData.nullifiers!.map((n) => (n.txid === TX.deposit ? { ...n, chainId: 999 } : n)) };
+    expect((await check(pkg, data)).failure?.check).toBe('event-chain-mismatch');
+  });
+
+  it('rejects a pool event from a different contract', async () => {
+    const data = { ...baseData, shields: baseData.shields!.map((s) => (s.txid === TX.shield ? { ...s, contract: WRONG_CONTRACT } : s)) };
+    expect((await check(pkg, data)).failure?.check).toBe('event-contract-mismatch');
+  });
+
+  it('rejects an adjudicator event from a different contract', async () => {
+    const data = { ...baseData, deposits: baseData.deposits!.map((d) => ({ ...d, contract: WRONG_CONTRACT })) };
+    expect((await check(pkg, data)).failure?.check).toBe('event-contract-mismatch');
+  });
+
+  it('rejects a channel hop when the statement names no adjudicator', async () => {
+    const minimal = await buildDisclosurePackage({
+      keyset: keys,
+      domain,
+      verifier: 'v',
+      context: 'no-adjudicator',
+      issuedAt: 1_700_000_000,
+      endpoints: [],
+      openings: [{ label: 'N1', random: R1, token: usdc, value: V1, tree: 0, position: 5 }],
+      spends: [{ id: 'n1', opening: 'N1' }],
+      hops: [{ kind: 'H4', proof: 'n1', channelId: CHANNEL, expectedHeld: V1.toString(), asset: USDC, depositTxid: TX.deposit }],
+      prover,
+      artifacts,
+      signEndpoint: signerFor([]),
+    });
+    const adaptParams = keccak256(AbiCoder.defaultAbiCoder().encode(['bytes32', 'uint256'], [CHANNEL, V1]));
+    const nullifier1 = poseidon([keys.nullifyingKey, 5n]);
+    const data: DisclosureChainData = {
+      deposits: [{ ...adjScope, txid: TX.deposit, channelId: CHANNEL, asset: USDC, held: V1.toString(), adaptParams }],
+      nullifiers: [{ ...poolScope, tree: 0, nullifier: nullifier1, txid: TX.deposit, blockNumber: 1 }],
+    };
+    expect((await check(minimal, data)).failure?.check).toBe('missing-adjudicator');
   }, 60_000);
 });

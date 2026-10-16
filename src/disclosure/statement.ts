@@ -28,6 +28,7 @@ export const DISCLOSURE_EIP712_TYPES: Record<string, TypedDataField[]> = {
     { name: 'context', type: 'string' },
     { name: 'issuedAt', type: 'uint64' },
     { name: 'endpoints', type: 'Endpoint[]' },
+    { name: 'adjudicator', type: 'address' },
     { name: 'hopsHash', type: 'bytes32' },
   ],
   Endpoint: [
@@ -54,6 +55,7 @@ export function statementMessage(statement: DisclosureStatement): Record<string,
     context: statement.context,
     issuedAt: statement.issuedAt,
     endpoints: statement.endpoints.map((e) => ({ role: e.role, account: e.account })),
+    adjudicator: statement.adjudicator,
     hopsHash: statement.hopsHash,
   };
 }

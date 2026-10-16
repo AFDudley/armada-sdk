@@ -63,9 +63,16 @@ export { InMemoryDisclosureChainSource } from './chain-source';
 export type {
   DisclosureChainSource,
   DisclosureChainData,
+  EventScope,
+  ScopedShieldCommitment,
+  ScopedTransactCommitment,
+  ScopedNullifier,
+  ScopedUnshield,
   HubDepositRecord,
   HubAllocation,
   HubFinalizedOutcomeRecord,
+  HubSignatureRequest,
+  NitroSignature,
 } from './chain-source';
 
 // Checker.

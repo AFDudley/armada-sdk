@@ -1,6 +1,7 @@
 // ABOUTME: Disclosure package builder (ADR-0020) — from the wallet keys and its own note data, produces
 // ABOUTME: the openings, the Groth16 disclosure proofs for chosen nullifiers, and the statement to sign.
 
+import { ZeroAddress } from 'ethers';
 import type { TypedDataDomain, TypedDataField } from 'ethers';
 import { ShieldNote, type TokenData } from '../core/index';
 import type { ArtifactSet, ProverAdapter } from '../prover/index';
@@ -59,6 +60,8 @@ export interface BuildDisclosureParams {
   /** Unix seconds; defaults to `Math.floor(Date.now() / 1000)`. */
   readonly issuedAt?: number;
   readonly endpoints: readonly { role: string; account: string }[];
+  /** The armada-nitro adjudicator address, required when the hops include H4, H5 or H7 (D20.6). */
+  readonly adjudicator?: string;
   readonly openings: readonly BuilderOpening[];
   readonly spends: readonly BuilderSpend[];
   readonly hops: readonly Hop[];
@@ -97,6 +100,7 @@ export async function buildDisclosurePackage(params: BuildDisclosureParams): Pro
     context: params.context,
     issuedAt,
     endpoints: params.endpoints.map((e) => ({ role: e.role, account: e.account })),
+    adjudicator: params.adjudicator ?? ZeroAddress,
     hopsHash: hashHops(params.hops),
   };
 
