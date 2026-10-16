@@ -18,17 +18,17 @@ interface PersistedScan {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// `chain/` prefix → chain-derived, so resetChainState() wipes it on redeploy (keeps identity records).
-// `recordId` is the wallet's opaque id (`walletRecordId`) — never the 0zk address: keys are stored in
-// plaintext even when values are encrypted (SPEC §4.3).
-export function scanStateKey(recordId: string): string {
-  return `chain/scan-state/${recordId}`;
-}
+// `chain/` → chain-derived, so resetChainState() wipes it on redeploy (keeps identity records). The key is per
+// wallet because `storage` is the wallet's scoped store (see `resolveWalletStorage`), which files it under the
+// wallet's opaque tag — never its 0zk address, since keys are stored in plaintext (SPEC §4.3).
+export const SCAN_STATE_KEY = 'chain/scan-state';
 
-/** Persist a wallet's scan state + the highest synced block (and that block's hash, when known). */
+/**
+ * Persist a wallet's scan state + the highest synced block (and that block's hash, when known), through the wallet's
+ * scoped store. A relaxed write: scan state is a cache that a rescan rebuilds.
+ */
 export async function saveScanState(
   storage: StorageAdapter,
-  recordId: string,
   state: WalletScanState,
   syncedThrough: number,
   syncedThroughHash?: string,
@@ -38,7 +38,7 @@ export async function saveScanState(
     syncedThrough,
     ...(syncedThroughHash !== undefined ? { syncedThroughHash } : {}),
   };
-  await storage.put(scanStateKey(recordId), encoder.encode(JSON.stringify(data)));
+  await storage.put(SCAN_STATE_KEY, encoder.encode(JSON.stringify(data)));
 }
 
 /**
@@ -50,11 +50,10 @@ export async function saveScanState(
  */
 export async function loadScanState(
   storage: StorageAdapter,
-  recordId: string,
 ): Promise<{ state: WalletScanState; syncedThrough: number; syncedThroughHash?: string } | undefined> {
   let raw: Uint8Array | undefined;
   try {
-    raw = await storage.get(scanStateKey(recordId));
+    raw = await storage.get(SCAN_STATE_KEY);
   } catch {
     // e.g. an EncryptedStore GCM auth failure on a corrupted/foreign blob — treat as a cache miss.
     return undefined;

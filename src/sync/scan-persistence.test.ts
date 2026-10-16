@@ -5,6 +5,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { initPoseidonPromise, TransactNote } from '../core/index';
 import { MemoryStorageAdapter } from '../storage/index';
 import { EncryptedStore, deriveStorageKey } from '../storage/encrypted';
+import { ScopedStore } from '../storage/scoped';
 import { WalletScanState } from './scan-engine';
 import type { DecodedPoolEvents, DecodedTransactCommitment } from './event-decoder';
 import type { CommitmentCiphertextV2 } from './note-crypto';
@@ -70,8 +71,8 @@ describe('scan-state persistence (§4.3/§4.4)', () => {
     await storage.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
     const state = await buildState();
 
-    await saveScanState(storage, '0zk_alice', state, 500);
-    const loaded = await loadScanState(storage, '0zk_alice');
+    await saveScanState(storage, state, 500);
+    const loaded = await loadScanState(storage);
 
     expect(loaded).toBeDefined();
     expect(loaded!.syncedThrough).toBe(500);
@@ -85,12 +86,14 @@ describe('scan-state persistence (§4.3/§4.4)', () => {
     const state = await buildState();
     const hash = `0x${'ab'.repeat(32)}`;
 
-    await saveScanState(storage, '0zk_alice', state, 500, hash);
-    expect((await loadScanState(storage, '0zk_alice'))?.syncedThroughHash).toBe(hash);
+    const alice = new ScopedStore(storage, 'alice');
+    await saveScanState(alice, state, 500, hash);
+    expect((await loadScanState(alice))?.syncedThroughHash).toBe(hash);
 
     // A record written before the hash existed still loads; the reorg check just skips it once.
-    await saveScanState(storage, '0zk_bob', state, 500);
-    const legacy = await loadScanState(storage, '0zk_bob');
+    const bob = new ScopedStore(storage, 'bob');
+    await saveScanState(bob, state, 500);
+    const legacy = await loadScanState(bob);
     expect(legacy?.syncedThrough).toBe(500);
     expect(legacy?.syncedThroughHash).toBeUndefined();
   });
@@ -98,7 +101,7 @@ describe('scan-state persistence (§4.3/§4.4)', () => {
   it('returns undefined for a wallet with no persisted state', async () => {
     const storage = new MemoryStorageAdapter();
     await storage.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
-    expect(await loadScanState(storage, 'nobody')).toBeUndefined();
+    expect(await loadScanState(storage)).toBeUndefined();
   });
 
   it('degrades a corrupt (unparseable) record to a cache miss instead of throwing (M4)', async () => {
@@ -106,8 +109,8 @@ describe('scan-state persistence (§4.3/§4.4)', () => {
     // future sync — the in-process form of the "delete the DB by hand" pitfall §4.3 removes.
     const storage = new MemoryStorageAdapter();
     await storage.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
-    await storage.put('chain/scan-state/0zk_alice', new TextEncoder().encode('{not valid json'));
-    expect(await loadScanState(storage, '0zk_alice')).toBeUndefined();
+    await storage.put('chain/scan-state', new TextEncoder().encode('{not valid json'));
+    expect(await loadScanState(storage)).toBeUndefined();
   });
 
   it('degrades an undecryptable encrypted record to a cache miss (M4, GCM auth failure)', async () => {
@@ -116,9 +119,9 @@ describe('scan-state persistence (§4.3/§4.4)', () => {
     const inner = new MemoryStorageAdapter();
     await inner.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
     const writer = new EncryptedStore(inner, deriveStorageKey(new Uint8Array(32).fill(1)));
-    await saveScanState(writer, '0zk_bob', await buildState(), 42);
+    await saveScanState(writer, await buildState(), 42);
 
     const reader = new EncryptedStore(inner, deriveStorageKey(new Uint8Array(32).fill(2))); // wrong key
-    expect(await loadScanState(reader, '0zk_bob')).toBeUndefined();
+    expect(await loadScanState(reader)).toBeUndefined();
   });
 });

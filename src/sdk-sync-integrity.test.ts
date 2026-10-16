@@ -110,7 +110,7 @@ vi.mock('ethers', async (importActual) => {
 });
 
 import { Interface } from 'ethers';
-import { createArmadaSdk } from './sdk';
+import { createArmadaSdk, resolveWalletStorage } from './sdk';
 import { MemoryStorageAdapter } from './storage/index';
 import { initPoseidonPromise, getTokenDataERC20, getTokenDataHash, ShieldNote, TransactNote } from './core/index';
 import { serializeQuickSync, createTransferNote, encryptNoteToReceiver, type DecodedShieldCommitment } from './sync/index';
@@ -232,7 +232,7 @@ async function pushTransfer(block: number, receiver: Keyset, value: bigint, memo
 class FlakyStorage extends MemoryStorageAdapter {
   failNextScanStatePut = false;
   override async put(key: string, value: Uint8Array): Promise<void> {
-    if (this.failNextScanStatePut && key.startsWith('chain/scan-state/')) {
+    if (this.failNextScanStatePut && /^chain\/[^/]+\/scan-state$/.test(key)) { // a wallet's scoped scan-state record
       this.failNextScanStatePut = false;
       throw new Error('QuotaExceededError');
     }
@@ -425,7 +425,7 @@ describe('API-1: creationBlock only limits note discovery; the tree is always bu
     pushTransact(150, [102n]);
     chain.head = 200;
     const storage = new MemoryStorageAdapter();
-    await saveScanState(storage, walletRecordId(keyset.viewingPrivateKey), new WalletScanState(), 120); // empty tree @120
+    await saveScanState(resolveWalletStorage(storage, keyset.viewingPrivateKey, true), new WalletScanState(), 120); // empty tree @120
     const events: { event: string; data: unknown }[] = [];
     const sdk = await createArmadaSdk(
       cfg({ storage, dangerouslyAllowPlaintextStorage: true, telemetry: { emit: (event, data) => events.push({ event, data }) } }),
@@ -613,8 +613,8 @@ describe('WS-1: stored record keys never contain the 0zk address', () => {
     const keys: string[] = [];
     for await (const { key } of storage.list('')) keys.push(key);
     const id = walletRecordId(keyset.viewingPrivateKey);
-    expect(keys).toContain(`chain/scan-state/${id}`);
-    expect(keys).toContain(`chain/pending-spends/${id}`);
+    expect(keys).toContain(`chain/${id}/scan-state`);
+    expect(keys).toContain(`chain/${id}/pending-spends`);
     expect(keys.some((k) => k.includes(keyset.shieldedAddress))).toBe(false);
     await sdk.close();
   });
@@ -639,6 +639,7 @@ describe('API-2: a consumer telemetry sink can never break the SDK', () => {
   it('a sink that throws on the redeploy-reset event does not fail createArmadaSdk', async () => {
     const storage = new MemoryStorageAdapter();
     await storage.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 99 });
+    await storage.close();
     // Same store, different deployBlock → the SDK resets chain state and emits storage.chain-reset.
     await expect(createArmadaSdk(cfg({ storage, telemetry: throwingSink }))).resolves.toBeDefined();
   });

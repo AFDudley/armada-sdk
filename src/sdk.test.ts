@@ -206,9 +206,10 @@ describe('createArmadaSdk (§4.1)', () => {
 
   it('a wallet loads its persisted checkpoint from storage when created (P4.6, #119)', async () => {
     const store = new MemoryStorageAdapter();
-    await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
-    const recordId = walletRecordId((await deriveKeyset(seed(0x77))).viewingPrivateKey);
-    await saveScanState(store, recordId, new WalletScanState(), 500); // pre-seed a checkpoint at block 500
+    await store.open({ schemaVersion: 2, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
+    const walletStore = resolveWalletStorage(store, (await deriveKeyset(seed(0x77))).viewingPrivateKey, true);
+    await saveScanState(walletStore, new WalletScanState(), 500); // pre-seed a checkpoint at block 500
+    await store.close(); // the SDK opens it itself, as a fresh instance would
 
     // Plaintext storage so the wallet reads the raw adapter we seeded (bypasses the per-wallet key).
     const sdk = await createArmadaSdk({ ...makeConfig(), storage: store, dangerouslyAllowPlaintextStorage: true });
@@ -221,7 +222,8 @@ describe('createArmadaSdk (§4.1)', () => {
     // WHY: an operator should see chain-derived state being wiped on a deploy-block change. Pre-open the
     // store under deployBlock 1, then construct an instance at deployBlock 2 → mismatch → reset → emit.
     const store = new MemoryStorageAdapter();
-    await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
+    await store.open({ schemaVersion: 2, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
+    await store.close();
     const events: { event: string; data: unknown }[] = [];
     const cfg: ArmadaSdkConfig = {
       ...makeConfig(),
@@ -529,20 +531,62 @@ describe('resolveWalletStorage — at-rest encryption is on by default (SPEC §4
     expect(dec((await secure.get('chain/scan-state/x'))!)).toBe('secret-note-random-and-value'); // readable to the wallet
   });
 
-  it('returns the raw adapter unwrapped ONLY with the explicit danger flag', async () => {
+  it('the danger flag drops ONLY the encryption: records are still scoped to the wallet', async () => {
     const raw = new MemoryStorageAdapter();
-    expect(resolveWalletStorage(raw, vk, true)).toBe(raw);
+    await raw.open(ns);
+    const plain = resolveWalletStorage(raw, vk, true);
+    await plain.put('chain/scan-state', enc('visible'));
+    expect(dec((await raw.get(`chain/${walletRecordId(vk)}/scan-state`))!)).toBe('visible');
   });
 
-  it('derives distinct per-wallet keys so one wallet cannot read another\'s records', async () => {
-    // WHY: storage is shared across wallets in an instance; an instance-wide key would let wallet B
-    // decrypt wallet A's blobs. Per-wallet keys (from the viewing key) make that a GCM auth failure.
+  it('gives each wallet its own records: another wallet sees nothing under the same name (WS-2, #138)', async () => {
+    // WHY: wallets shared one flat key space, so a fixed-name record of one overwrote another's, and listing a shared
+    // prefix hit a GCM failure on the other wallet's records. Each wallet's records now live under its own scope.
     const raw = new MemoryStorageAdapter();
     await raw.open(ns);
     const a = resolveWalletStorage(raw, new Uint8Array(32).fill(1), false);
     const b = resolveWalletStorage(raw, new Uint8Array(32).fill(2), false);
-    await a.put('chain/scan-state/shared-key', enc('A private notes'));
-    await expect(b.get('chain/scan-state/shared-key')).rejects.toThrow();
+    await a.put('chain/scan-state', enc('A private notes'));
+    expect(await b.get('chain/scan-state')).toBeUndefined();
+    await b.put('chain/scan-state', enc('B'));
+    expect(dec((await a.get('chain/scan-state'))!)).toBe('A private notes');
+  });
+});
+
+describe('wallet records on a shared adapter (#138)', () => {
+  // A MemoryStorageAdapter that records every batch's options, to see which writes ask for durability.
+  class RecordingStore extends MemoryStorageAdapter {
+    readonly batches: { keys: string[]; durable: boolean }[] = [];
+    override async batch(ops: Parameters<MemoryStorageAdapter['batch']>[0], options?: { durable?: boolean }): Promise<void> {
+      this.batches.push({ keys: ops.map((o) => o.key), durable: options?.durable === true });
+      return super.batch(ops);
+    }
+  }
+
+  it('writes spend holds durably, under the wallet\'s own scope', async () => {
+    // WHY: a lost hold re-exposes an in-flight note to the planner (a wasted proof), so the holds record is committed
+    // to disk before markSpendPending resolves. Scan state is a cache and stays a relaxed write.
+    const store = new RecordingStore();
+    const sdk = await createArmadaSdk({ ...makeConfig(), storage: store });
+    const wallet = await sdk.wallet.fromRootSecret(seed(0x33), { creationBlock: 1 });
+    await wallet.markSpendPending([], `0x${'ab'.repeat(32)}`); // always writes the holds record (none → a delete)
+    const tag = walletRecordId((await deriveKeyset(seed(0x33))).viewingPrivateKey);
+    expect(store.batches).toContainEqual({ keys: [`chain/${tag}/pending-spends`], durable: true });
+    await sdk.close();
+  });
+
+  it('a store written under the previous key layout (schema 1) is reset once, so its records are rebuilt (#138)', async () => {
+    // WHY: scoping changed where every wallet record lives. The storage schema version moved to 2, so opening an older
+    // store runs the deployment-change reset: the stale chain records go, and the wallet rescans into the new layout.
+    const store = new MemoryStorageAdapter();
+    await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
+    await store.put('chain/scan-state/0123456789abcdef', new Uint8Array([1]));
+    await store.close();
+    const events: string[] = [];
+    const sdk = await createArmadaSdk({ ...makeConfig(), storage: store, telemetry: { emit: (...[event]) => { events.push(event); } } });
+    expect(events).toContain('storage.chain-reset');
+    expect(await store.get('chain/scan-state/0123456789abcdef')).toBeUndefined();
+    await sdk.close();
   });
 });
 
@@ -638,8 +682,7 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
   ) {
     await initPoseidonPromise;
     const store = new MemoryStorageAdapter();
-    await store.open({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
-    const recordId = walletRecordId((await deriveKeyset(seed(0x55))).viewingPrivateKey);
+    await store.open({ schemaVersion: 2, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock: 1 });
     const trees = Object.entries(notesByTree).map(([tree, values]) => ({
       tree: Number(tree),
       leaves: values.map((_, i) => leaf(Number(tree) * 1000 + i + 1)),
@@ -651,7 +694,8 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
       })),
     );
     const state = WalletScanState.restore({ trees, txos, spent: [], unshields: [], sent: [] });
-    await saveScanState(store, recordId, state, 500);
+    await saveScanState(resolveWalletStorage(store, (await deriveKeyset(seed(0x55))).viewingPrivateKey, true), state, 500);
+    await store.close(); // the SDK opens it itself, as a fresh instance would
     const base = makeConfig();
     const sdk = await createArmadaSdk({
       ...base,

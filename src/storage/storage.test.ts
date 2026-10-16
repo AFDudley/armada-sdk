@@ -58,6 +58,7 @@ describe('MemoryStorageAdapter', () => {
     expect(await s.open(ns(10))).toEqual({ reset: false }); // first open — nothing to reset
     await s.put('chain/merkle/0', bytes('m'));
     await s.put('identity/wallet/x', bytes('id'));
+    await s.close(); // a redeploy reopens the store from a fresh instance
     expect(await s.open(ns(20))).toEqual({ reset: true }); // redeploy → different deployBlock → reset
     expect(await s.get('chain/merkle/0')).toBeUndefined();
     expect(str((await s.get('identity/wallet/x'))!)).toBe('id');

@@ -9,7 +9,7 @@ export { RpcEventSource, IndexerEventSource } from '../sync/event-source';
 export type { EventBatch, EventSource, IndexerEventSourceOptions } from '../sync/event-source';
 export { WalletScanState, ownedNoteFromTransactNote } from '../sync/scan-engine';
 export type { WalletDecryptors, Decryptor, OwnedNote, ApplyResult, ScanStateSnapshot } from '../sync/scan-engine';
-export { saveScanState, loadScanState, scanStateKey } from '../sync/scan-persistence';
+export { saveScanState, loadScanState, SCAN_STATE_KEY } from '../sync/scan-persistence';
 export { UTXOMerkletree } from '../sync/merkletree';
 export type { MerkleProof } from '../sync/merkletree';
 export { startAutoSync } from '../sync/auto-sync';
@@ -32,10 +32,11 @@ export type { PendingSpend, BalanceOptions } from '../sync/balances';
 export { newReceivedNotes, ownSpendTxids } from '../sync/history';
 
 // ── Pending-spend holds ──
-export { PendingSpends, savePendingSpends, loadPendingSpends, pendingSpendsKey } from '../sync/pending-spends';
+export { PendingSpends, savePendingSpends, loadPendingSpends, PENDING_SPENDS_KEY } from '../sync/pending-spends';
 
 // ── Storage encryption & keys ──
 export { EncryptedStore, deriveStorageKey, deriveWalletStorageKey, walletRecordId } from '../storage/encrypted';
+export { ScopedStore } from '../storage/scoped';
 
 // ── Planning & proving pipeline (the wallet methods are the public API) ──
 export { planTransfer, planSpend, planWitnessInputs } from '../tx/plan';

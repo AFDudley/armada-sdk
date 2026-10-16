@@ -5,8 +5,8 @@
 // ^ IndexedDB (IDBDatabase/IDBRequest/…) types — this module is browser-only; the tsconfig `lib` is
 //   ES2022 (no DOM) since the SDK also targets Node. Node consumers never instantiate this class.
 
-import type { StorageAdapter, StorageNamespace } from './index';
-import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual } from './namespace';
+import type { StorageAdapter, StorageNamespace, StorageOp, StorageWriteOptions } from './index';
+import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding } from './namespace';
 import { StorageConflictError } from '../errors';
 
 const STORE = 'kv';
@@ -32,30 +32,53 @@ function txDone(tx: IDBTransaction): Promise<void> {
   });
 }
 
+/** Construction options for `IndexedDBStorageAdapter`. */
+export interface IndexedDBStorageAdapterOptions {
+  /**
+   * Run without the exclusive Web Lock. ONLY for environments that have no Web Locks API (test harnesses such as
+   * jsdom or Node + fake-indexeddb), where nothing else can open the database anyway. Without it, such an
+   * environment fails closed rather than risk two instances corrupting each other's scan state.
+   */
+  readonly dangerouslySkipLock?: boolean;
+}
+
 /**
  * IndexedDB-backed KV. Values are stored as `Uint8Array` (structured-clone native). `dbName` scopes the
  * database — pass a per-app name. `open()` takes an origin-scoped EXCLUSIVE Web Lock on `dbName` (held
  * until `close()`): IndexedDB itself allows many connections to one DB, but the SDK's scan-state
  * read-modify-write is not safe across instances, so a second live instance on the same DB fails loud
- * with `StorageConflictError` instead of silently corrupting shared scan state.
+ * with `StorageConflictError` instead of silently corrupting shared scan state. Where the browser has no
+ * Web Locks API (an insecure context, or a very old browser) `open()` fails closed with
+ * `StorageConflictError` too, unless the adapter was built with `dangerouslySkipLock`.
  */
 export class IndexedDBStorageAdapter implements StorageAdapter {
   private db: IDBDatabase | undefined;
   private lockRelease: (() => void) | undefined;
+  // The namespace this adapter is open under, until close().
+  private bound: Uint8Array | undefined;
 
-  constructor(private readonly dbName: string) {}
+  constructor(
+    private readonly dbName: string,
+    private readonly options: IndexedDBStorageAdapterOptions = {},
+  ) {}
 
   /**
    * Acquire an origin-scoped exclusive lock on `dbName` (Web Locks API), held for this adapter's
    * lifetime. Turns concurrent same-DB instances (silent scan-state corruption) into a loud
    * `StorageConflictError` — the browser analog of `LevelStorageAdapter`'s single-process file lock.
-   * Feature-detected: environments without `navigator.locks` (older browsers / test harnesses) skip it.
+   * Without the Web Locks API it fails closed, unless `dangerouslySkipLock` was set.
    */
   private async acquireLock(): Promise<void> {
     if (this.lockRelease !== undefined) return; // already held — open() is idempotent
+    if (this.options.dangerouslySkipLock === true) return;
     const locks: LockManager | undefined =
       typeof navigator !== 'undefined' && 'locks' in navigator ? navigator.locks : undefined;
-    if (locks === undefined) return;
+    if (locks === undefined) {
+      throw new StorageConflictError(
+        `IndexedDBStorageAdapter: this environment has no Web Locks API (navigator.locks), so "${this.dbName}" can't be ` +
+          `locked against a second instance; refusing to open unlocked (set dangerouslySkipLock only for test harnesses)`,
+      );
+    }
     const name = `armada-sdk-storage:${this.dbName}`;
     await new Promise<void>((acquired, failed) => {
       locks
@@ -99,9 +122,10 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
   }
 
   async open(namespace: StorageNamespace): Promise<{ reset: boolean }> {
+    const nsBytes = encodeNamespace(namespace);
+    if (assertSameBinding('IndexedDBStorageAdapter', this.bound, nsBytes)) return { reset: false };
     await this.acquireLock();
     await this.database();
-    const nsBytes = encodeNamespace(namespace);
     const previous = await this.get(NAMESPACE_KEY);
     const reset = previous !== undefined && !bytesEqual(previous, nsBytes);
     if (reset) {
@@ -109,6 +133,7 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
       await this.resetChainState();
     }
     await this.put(NAMESPACE_KEY, nsBytes);
+    this.bound = nsBytes;
     return { reset };
   }
 
@@ -127,6 +152,49 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
     const store = await this.store('readwrite');
     store.delete(key);
     await txDone(store.transaction);
+  }
+
+  // One readwrite transaction: IndexedDB serializes overlapping readwrite transactions on a store, so no other
+  // write lands between the read and the write. The read's success handler computes and writes directly — awaiting
+  // anything in between would let the transaction commit early.
+  async update(
+    key: string,
+    fn: (current: Uint8Array | undefined) => Uint8Array | undefined,
+    options?: StorageWriteOptions,
+  ): Promise<Uint8Array | undefined> {
+    const db = await this.database();
+    return new Promise<Uint8Array | undefined>((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite', { durability: options?.durable === true ? 'strict' : 'default' });
+      const store = tx.objectStore(STORE);
+      let next: Uint8Array | undefined;
+      let failure: unknown;
+      const request = store.get(key);
+      request.onsuccess = (): void => {
+        try {
+          next = fn(request.result === undefined ? undefined : toUint8Array(request.result));
+        } catch (err) {
+          failure = err;
+          tx.abort();
+          return;
+        }
+        if (next === undefined) store.delete(key);
+        else store.put(next.slice(), key);
+      };
+      tx.oncomplete = (): void => resolve(next);
+      tx.onerror = (): void => reject(failure ?? tx.error);
+      tx.onabort = (): void => reject(failure ?? tx.error);
+    });
+  }
+
+  async batch(ops: readonly StorageOp[], options?: StorageWriteOptions): Promise<void> {
+    const db = await this.database();
+    const tx = db.transaction(STORE, 'readwrite', { durability: options?.durable === true ? 'strict' : 'default' });
+    const store = tx.objectStore(STORE);
+    for (const op of ops) {
+      if (op.type === 'put') store.put(op.value.slice(), op.key);
+      else store.delete(op.key);
+    }
+    await txDone(tx);
   }
 
   async *list(prefix: string): AsyncIterable<{ key: string; value: Uint8Array }> {
@@ -158,5 +226,6 @@ export class IndexedDBStorageAdapter implements StorageAdapter {
     // Release the exclusive lock so a fresh instance for this DB can open (unlock → lock → unlock).
     this.lockRelease?.();
     this.lockRelease = undefined;
+    this.bound = undefined;
   }
 }

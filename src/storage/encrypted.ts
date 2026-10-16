@@ -4,7 +4,7 @@
 import { gcm } from '@noble/ciphers/aes';
 import { hkdf } from '@noble/hashes/hkdf';
 import { sha256 } from '@noble/hashes/sha256';
-import type { StorageAdapter, StorageNamespace } from './index';
+import type { StorageAdapter, StorageNamespace, StorageOp, StorageWriteOptions } from './index';
 import { InvalidKeyMaterialError } from '../errors';
 import { DOMAIN_TAGS } from '../crypto/domain-tags';
 
@@ -85,17 +85,37 @@ export class EncryptedStore implements StorageAdapter {
   }
 
   async put(key: string, plaintext: Uint8Array): Promise<void> {
-    const nonce = randomNonce();
-    const ciphertext = gcm(this.key, nonce, aad(key)).encrypt(plaintext);
-    const blob = new Uint8Array(nonce.length + ciphertext.length);
-    blob.set(nonce, 0);
-    blob.set(ciphertext, nonce.length);
-    await this.inner.put(key, blob);
+    await this.inner.put(key, this.encrypt(plaintext, key));
   }
 
   async get(key: string): Promise<Uint8Array | undefined> {
     const blob = await this.inner.get(key);
     return blob === undefined ? undefined : this.decrypt(blob, key);
+  }
+
+  // AES-GCM here is synchronous, so decrypting and re-encrypting inside the inner adapter's update keeps it atomic.
+  async update(
+    key: string,
+    fn: (current: Uint8Array | undefined) => Uint8Array | undefined,
+    options?: StorageWriteOptions,
+  ): Promise<Uint8Array | undefined> {
+    let plaintext: Uint8Array | undefined;
+    await this.inner.update(
+      key,
+      (blob) => {
+        plaintext = fn(blob === undefined ? undefined : this.decrypt(blob, key));
+        return plaintext === undefined ? undefined : this.encrypt(plaintext, key);
+      },
+      options,
+    );
+    return plaintext;
+  }
+
+  batch(ops: readonly StorageOp[], options?: StorageWriteOptions): Promise<void> {
+    return this.inner.batch(
+      ops.map((op) => (op.type === 'put' ? { type: 'put', key: op.key, value: this.encrypt(op.value, op.key) } : op)),
+      options,
+    );
   }
 
   async *list(prefix: string): AsyncIterable<{ key: string; value: Uint8Array }> {
@@ -114,6 +134,16 @@ export class EncryptedStore implements StorageAdapter {
 
   close(): Promise<void> {
     return this.inner.close();
+  }
+
+  /** GCM-encrypt `plaintext` under a fresh nonce and the record key's AAD, as `nonce ‖ ciphertext`. */
+  private encrypt(plaintext: Uint8Array, key: string): Uint8Array {
+    const nonce = randomNonce();
+    const ciphertext = gcm(this.key, nonce, aad(key)).encrypt(plaintext);
+    const blob = new Uint8Array(nonce.length + ciphertext.length);
+    blob.set(nonce, 0);
+    blob.set(ciphertext, nonce.length);
+    return blob;
   }
 
   /** GCM-decrypt a `nonce ‖ ciphertext` blob under the record key's AAD. Throws on wrong key /

@@ -48,7 +48,8 @@ describe('LevelStorageAdapter (§4.3)', () => {
     await s.put('identity/wallet/x', bytes('id'));
     await s.put('durable/claim-counter', bytes('7'));
 
-    // Reopen the SAME db under a changed deployBlock → chain state wiped, identity + durable kept.
+    // Close, then reopen the SAME db under a changed deployBlock → chain state wiped, identity + durable kept.
+    await s.close();
     expect(await s.open(ns(20))).toEqual({ reset: true });
     expect(await s.get('chain/merkle/0')).toBeUndefined();
     expect(str((await s.get('identity/wallet/x'))!)).toBe('id');
@@ -66,8 +67,31 @@ describe('LevelStorageAdapter (§4.3)', () => {
       get: async () => undefined,
       put: async () => {},
       del: async () => {},
+      batch: async () => {},
       iterator: () => ({ all: async () => [] }),
     };
     await expect(new LevelStorageAdapter(locked).open(ns(1))).rejects.toBeInstanceOf(StorageConflictError);
+  });
+
+  it('recognises the lock through the cause chain, as abstract-level 3.x reports it (WS-4)', async () => {
+    // WHY: real abstract-level 3.x throws LEVEL_DATABASE_NOT_OPEN with the LEVEL_LOCKED error as its `cause`, so a
+    // check of the top-level code alone never fired and a second process got an opaque "not open" error.
+    const wrapped = Object.assign(new Error('Database failed to open'), {
+      code: 'LEVEL_DATABASE_NOT_OPEN',
+      cause: Object.assign(new Error('IO error: LOCK: Resource temporarily unavailable'), { code: 'LEVEL_LOCKED' }),
+    });
+    const locked: AbstractLevelLike = {
+      status: 'closed',
+      open: async () => { throw wrapped; },
+      close: async () => {},
+      get: async () => undefined,
+      put: async () => {},
+      del: async () => {},
+      batch: async () => {},
+      iterator: () => ({ all: async () => [] }),
+    };
+    const err = await new LevelStorageAdapter(locked).open(ns(1)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StorageConflictError);
+    expect((err as Error).cause).toBe(wrapped);
   });
 });

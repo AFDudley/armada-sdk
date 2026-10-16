@@ -7,8 +7,9 @@ address.
 ## Storage
 
 The storage adapter persists scan state, notes, and balances. It is a key-value store with prefix
-iteration (`get`, `put`, `del`, `list`, plus `open`/`close` and a chain-state reset). Three
-implementations ship with the SDK:
+iteration (`get`, `put`, `del`, `list`), atomic writes (`update` for a read-modify-write, `batch`
+for several keys at once, either of which can ask to be durable), plus `open`/`close` and a
+chain-state reset. Three implementations ship with the SDK:
 
 ```ts
 import {
@@ -26,8 +27,18 @@ new LevelStorageAdapter(db);            // Node; wraps an abstract-level databas
 - `IndexedDBStorageAdapter` — browser persistence, keyed by the database name you pass.
 - `LevelStorageAdapter` — Node persistence over any `abstract-level` database.
 
-Note data is [encrypted at rest](./security) on top of whatever adapter you pass, so a custom
-adapter does not need to handle encryption itself — it only needs to store and retrieve bytes.
+Only one live instance may use a store at a time. `IndexedDBStorageAdapter` takes an exclusive Web Lock
+on its database, and a second instance gets `StorageConflictError`; if the browser has no Web Locks
+API (an insecure context, or a very old browser), it refuses to open rather than run unlocked. A test
+harness without Web Locks (jsdom, or Node with fake-indexeddb) passes
+`new IndexedDBStorageAdapter(name, { dangerouslySkipLock: true })`. `LevelStorageAdapter` relies on the
+database's own lock and reports a second process as `StorageConflictError` too. Opening an adapter
+that is already open under a different deployment also throws `StorageConflictError`.
+
+Note data is [encrypted at rest](./security) on top of whatever adapter you pass, and each wallet's
+records are kept in their own scope, so a custom adapter does not need to handle encryption or
+separation itself. It needs to store and retrieve bytes, list keys in key order, and make `update`
+and `batch` atomic.
 
 ## Prover
 

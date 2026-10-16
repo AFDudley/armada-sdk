@@ -440,6 +440,10 @@ viewWallet = await sdk.wallet.viewOnlyFromViewingKey(shareableViewingKey, { crea
 ```ts
 interface StorageAdapter {           // environment adapters provided by the SDK:
   // browser: IndexedDB (native, no level-js); node: classic-level or SQLite
+  open(namespace); close(); resetChainState();
+  get(key); put(key, value); del(key); list(prefix);   // list in key order
+  update(key, fn, { durable }?);     // atomic read-modify-write; fn is synchronous
+  batch(ops, { durable }?);          // atomic multi-key write
 }
 ```
 
@@ -457,9 +461,18 @@ Requirements:
   plaintext to scrub, so tab crash leaks nothing. Record keys are stored in plaintext, so they never
   contain a wallet's 0zk address — a wallet's records are named by an opaque id derived from its
   viewing key.
+- **Per-wallet scopes.** Each wallet's records live under `<area>/<walletTag>/…` (area first, so the
+  reset rules above still apply), so wallets sharing an adapter can't list, overwrite or decrypt each
+  other's records; the full scoped key is the AEAD's associated data.
+- **Atomic and durable writes for fund-safety records.** `update` (read-modify-write) and `batch`
+  (multi-key) are atomic; `durable` commits to disk before resolving (IndexedDB `strict`, Level
+  `sync`). Spend holds are written durably today; the §6.2 claim-seed counter and the §7 journal
+  will be.
 - **Multi-instance safe.** No process-wide lock files. Browser: one IndexedDB per
-  (pool, origin); Node: per-instance path from config with advisory locking and a clear typed
-  error on conflict.
+  (pool, origin), held by an exclusive Web Lock, failing closed where Web Locks are unavailable;
+  Node: per-instance path from config with advisory locking. Either way, a conflict is a clear
+  typed error (`StorageConflictError`), and an open adapter refuses to rebind to another
+  deployment.
 - Ephemeral wallets (§6) never touch the StorageAdapter.
 
 ### 4.4 Sync
