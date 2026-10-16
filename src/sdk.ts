@@ -6,10 +6,8 @@ import {
   tryDecryptSentCommitment,
   reconstructHistory,
   erc20AddressFromHash,
-  encodeSelfMetadata,
   type SyncEventMap,
   type TXO,
-  type TokenAddressResolver,
   type Unsubscribe,
   type HistoryEntry,
   type ReceiverNoteKeys,
@@ -19,22 +17,17 @@ import {
   WalletScanState,
   RpcEventSource,
   IndexerEventSource,
-  SyncEmitter,
   decryptedCommitmentMatches,
   tryDecryptShield,
   shieldCommitmentMatches,
   ownedNoteFromTransactNote,
-  newReceivedNotes,
   PendingSpends,
   loadPendingSpends,
   savePendingSpends,
-  tokenHashKey,
   withTokenAddresses,
   EncryptedStore,
   deriveWalletStorageKey,
   walletRecordId,
-  planSpend,
-  planWitnessInputs,
   prove,
   proveAll,
   runPreflight,
@@ -45,11 +38,7 @@ import {
 import type { StorageAdapter } from './storage/index';
 import { ScopedStore } from './storage/scoped';
 import { isCrossChainUnshield, type Plan, type PlanSelection, type ProofHandle, type PreflightResult } from './tx/index';
-import { planConsolidate, txosAfterConsolidation } from './tx/consolidate';
-import { maxTransferAmount, maxUnshieldAmount } from './tx/max-transfer';
-import type { PlanTransferParams } from './tx/plan';
 import { planList } from './tx/plan';
-import type { WitnessOutputRequest } from './tx/witness';
 import {
   deriveKeyset,
   deriveKeysetFromMnemonic,
@@ -91,6 +80,9 @@ import { resolveConfig, type ResolvedConfig } from './config';
 import { ChainClient } from './chain/client';
 import { ChainState, CHAIN_CHUNK_BLOCKS, assertMatchesTree, assertShieldsMatchLeaves, noEvents, type ChainAdvance } from './chain/state';
 import { WalletNotes } from './sync/wallet-notes';
+import { WalletEvents, resolveTokenAddress } from './sync/wallet-events';
+import { SpendPlanner } from './tx/spend-planner';
+import { proveParamsFor } from './tx/prove-assembler';
 import { loadWalletNotes, saveWalletNotes, clearWalletNotes } from './sync/scan-persistence';
 import type { DecodedPoolEvents } from './sync/event-decoder';
 import { startAutoSync } from './sync/auto-sync';
@@ -104,6 +96,8 @@ export {
   scanStateMissingLeaves,
 } from './chain/sync-rules';
 export type { QuickSyncReason, QuickSyncTelemetry } from './chain/sync-rules';
+// The event payload builders live with the wallet's event stream; re-exported here, where tests have found them.
+export { buildBalanceUpdate, buildReceivedNote } from './sync/wallet-events';
 
 // Per-instance shared context handed to each wallet.
 interface SdkContext {
@@ -234,40 +228,6 @@ export function effectiveScanHead(rawHead: number, confirmationDepth: number): n
 }
 
 /**
- * Build a `balance:updated` payload for a token, resolving its address via `resolve`. The payload
- * carries BOTH the canonical `tokenHash` (normalized to the `balances()` join key) and the resolved
- * `tokenAddress`. Returns `undefined` for a hash with no registered token — an address can't be
- * recovered, so the caller skips the emit. Pure so the payload shape is unit-testable without a wallet.
- */
-export function buildBalanceUpdate(
-  tokenHash: string,
-  spendable: bigint,
-  pending: bigint,
-  resolve: TokenAddressResolver,
-): SyncEventMap['balance:updated'] | undefined {
-  const tokenAddress = resolve(tokenHash);
-  if (tokenAddress === undefined) return undefined; // unregistered token — no address to report
-  return { tokenHash: tokenHashKey(tokenHash), tokenAddress, spendable, pending };
-}
-
-/**
- * Build a `note:received` payload from a freshly discovered owned TXO, resolving its token address
- * via `resolve`. Carries both `tokenHash` and `tokenAddress`, plus memo/sender when the sender
- * disclosed them. Returns `undefined` for an unregistered token (skipped — no address to report).
- */
-export function buildReceivedNote(txo: TXO, resolve: TokenAddressResolver): SyncEventMap['note:received'] | undefined {
-  const tokenAddress = resolve(txo.tokenHash);
-  if (tokenAddress === undefined) return undefined; // unregistered token — no address to report
-  return {
-    tokenHash: tokenHashKey(txo.tokenHash),
-    tokenAddress,
-    value: txo.value,
-    ...(txo.memo !== undefined ? { memo: txo.memo } : {}),
-    ...(txo.senderShieldedAddress !== undefined ? { senderShieldedAddress: txo.senderShieldedAddress } : {}),
-  };
-}
-
-/**
  * Decide a sync's resume window from the last synced block + current chain head. Pure so the
  * resume decision (the thing that must never regress to a genesis rescan) is unit-testable without
  * a provider. `fromBlock` is the resume point (checkpoint + 1); `scanned` is false when the head
@@ -280,9 +240,6 @@ export function planSyncWindow(
   return { fromBlock: syncedThrough + 1, scanned: head > syncedThrough };
 }
 
-// Any EVM address: a plain unshield's max doesn't depend on where it goes, only on its value.
-const MAX_UNSHIELD_PROBE_RECIPIENT = '0x0000000000000000000000000000000000000001' as const;
-
 class ArmadaWallet implements Wallet {
   // The wallet's private notes (owned notes, its own spends, notes it authored). The trees are the instance's, in
   // `ChainState`; the notes are synced through `syncedThrough`, never past the chain's checkpoint.
@@ -294,15 +251,7 @@ class ArmadaWallet implements Wallet {
   // Optimistic in-flight spend holds (issue #55) — the wallet's own intent, kept apart from the chain-derived
   // scan state (which a sync replaces wholesale) and written durably whenever a hold changes.
   private holds = new PendingSpends();
-  private readonly emitter = new SyncEmitter();
-  // Last-emitted per-token balance (keyed by tokenHash, no 0x) so a sync only pushes `balance:updated`
-  // for tokens that actually changed — the diff that lets consumers avoid redundant re-reads.
-  private readonly lastBalances = new Map<string, { spendable: bigint; pending: bigint }>();
-  // Received-transfer keys already emitted as `note:received`. A loaded wallet seeds this from its saved
-  // notes; a wallet with no saved state seeds it on its first sync WITHOUT emitting (so a fresh wallet
-  // doesn't replay its history as "received"). Later syncs emit only genuinely-new incoming notes.
-  private readonly seenReceiveKeys = new Set<string>();
-  private receiveBaselined = false;
+  private readonly events = new WalletEvents();
   // The in-flight sync run, if any — concurrent sync() calls coalesce onto it instead of both building on
   // the same committed state (which would double-apply a range and throw a position gap).
   private syncInFlight: Promise<{ fromBlock: number; syncedThrough: number; scanned: boolean }> | undefined;
@@ -409,8 +358,7 @@ class ArmadaWallet implements Wallet {
       this.syncedThroughHash = persisted.syncedThroughHash;
       // The saved notes are already known: seed the receive baseline from them, so the first sync reports
       // exactly the notes that arrived since the checkpoint (e.g. while the app was closed).
-      newReceivedNotes(this.scanState.ownedTxos(), this.scanState.spentNullifiers(), this.keyset.nullifyingKey, this.seenReceiveKeys);
-      this.receiveBaselined = true;
+      this.events.baselineReceives(this.notes.ownedTxos(), this.notes.spentNullifiers(), this.keyset.nullifyingKey);
     }
     this.holds = await loadPendingSpends(this.storage);
     // A hold whose spend the saved state already confirms is done.
@@ -557,9 +505,7 @@ class ArmadaWallet implements Wallet {
     this.notes = new WalletNotes();
     this.syncedThrough = this.ctx.config.deployBlock - 1;
     this.syncedThroughHash = undefined;
-    this.lastBalances.clear();
-    this.seenReceiveKeys.clear();
-    this.receiveBaselined = false;
+    this.events.reset();
     // Delete the poisoned record so a crash mid-rescan can't load it again.
     if (!this.ephemeral) await clearWalletNotes(this.storage);
   }
@@ -577,8 +523,7 @@ class ArmadaWallet implements Wallet {
       }
       try {
         await wallet.ingest(batch.events, batch.timestamps, batch.toBlock, batch.toBlockHash);
-        wallet.emitBalanceUpdates(chainHead);
-        wallet.emitReceivedNotes();
+        wallet.emitUpdates(chainHead);
       } catch {
         // Deliberately swallowed: this sync is the other wallet's to report, not ours.
       }
@@ -587,7 +532,7 @@ class ArmadaWallet implements Wallet {
 
   on<K extends keyof SyncEventMap>(event: K, listener: (payload: SyncEventMap[K]) => void): Unsubscribe {
     this.assertUsable();
-    return this.emitter.on(event, listener);
+    return this.events.on(event, listener);
   }
 
   watch(options?: { intervalMs?: number; immediate?: boolean; onError?: (err: Error) => void }): Unsubscribe {
@@ -656,20 +601,18 @@ class ArmadaWallet implements Wallet {
         const span = head - fromBlock + 1;
         const emitProgress = (coveredThrough: number): void => {
           const done = Math.max(0, Math.min(span, coveredThrough - fromBlock + 1));
-          this.emitter.emit('scan:progress', { syncedThrough: coveredThrough, fraction: span <= 0 ? 1 : done / span });
+          this.events.emit('scan:progress', { syncedThrough: coveredThrough, fraction: span <= 0 ? 1 : done / span });
         };
-        this.emitter.emit('scan:started', { fromBlock, toBlock: head });
-        this.emitter.emit('scan:progress', { syncedThrough: fromBlock - 1, fraction: 0 });
+        this.events.emit('scan:started', { fromBlock, toBlock: head });
+        this.events.emit('scan:progress', { syncedThrough: fromBlock - 1, fraction: 0 });
 
         // Behind the chain (new, or loaded from an older save): catch up to its checkpoint first, so this wallet is
         // level with the chain when it advances and reads the new batch with the others.
         if (this.syncedThrough < chain.syncedThrough) await this.catchUp(chain.syncedThrough, emitProgress);
         await chain.advance(head, headHash, emitProgress, (batch) => this.deliver(batch, chainHead));
 
-        this.emitter.emit('scan:complete', { syncedThrough: this.syncedThrough });
-        // Balance events use the chain head, as `balances()` does, so both agree on spendable vs pending.
-        this.emitBalanceUpdates(chainHead);
-        this.emitReceivedNotes();
+        this.events.emit('scan:complete', { syncedThrough: this.syncedThrough });
+        this.emitUpdates(chainHead);
         return { fromBlock, syncedThrough: this.syncedThrough, scanned: true };
       } catch (err) {
         // Cancelled by dispose()/close() (its RPC calls may fail first, on the destroyed provider): no scan:error —
@@ -677,67 +620,20 @@ class ArmadaWallet implements Wallet {
         if (this.disposed || this.ctx.lifecycle.closed) {
           throw err instanceof InstanceClosedError ? err : new InstanceClosedError('sync: cancelled by wallet.dispose() or sdk.close()', { cause: err });
         }
-        this.emitter.emit('scan:error', { error: err instanceof Error ? err : new Error(String(err)) });
+        this.events.emit('scan:error', { error: err instanceof Error ? err : new Error(String(err)) });
         throw err;
       }
     });
   }
 
-  // Push `note:received` for incoming transfers discovered since the last sync (`newReceivedNotes`
-  // handles the classification + `tree:position` de-dup, mutating `seenReceiveKeys`). A wallet with no
-  // saved state seeds the baseline on its first sync WITHOUT emitting, so it doesn't replay history.
-  private emitReceivedNotes(): void {
-    const fresh = newReceivedNotes(
-      this.scanState.ownedTxos(),
-      this.scanState.spentNullifiers(),
-      this.keyset.nullifyingKey,
-      this.seenReceiveKeys,
-    );
-    if (!this.receiveBaselined) {
-      this.receiveBaselined = true;
-      return; // baseline: `seenReceiveKeys` is now seeded; don't emit historical receives on first load
-    }
-    for (const txo of fresh) {
-      const payload = buildReceivedNote(txo, (h) => this.resolveTokenAddress(h));
-      if (payload === undefined) continue; // unregistered token — can't resolve an address
-      this.emitter.emit('note:received', payload);
-    }
-  }
-
-  // Push `balance:updated` for each token whose (spendable, pending) changed since the last emit —
-  // including a token fully spent (drops out of `balances()`, so we emit a zero). Unregistered tokens
-  // (unknown hash → no address) are skipped. First sync after load emits the baseline for held tokens.
-  private emitBalanceUpdates(head: number): void {
+  // Push `balance:updated` for the tokens whose balance changed, then `note:received` for new incoming notes. Balance
+  // events use the chain head, as `balances()` does, so both agree on spendable vs pending.
+  private emitUpdates(chainHead: number): void {
     this.prunePendingSpends();
-    const balances = this.scanState.balances(this.keyset.nullifyingKey, { currentBlock: head, finalityThreshold: this.ctx.config.finalityThreshold }, this.holds.list());
-    const seen = new Set<string>();
-    for (const b of balances) {
-      seen.add(b.tokenHash);
-      const prev = this.lastBalances.get(b.tokenHash);
-      if (prev !== undefined && prev.spendable === b.spendable && prev.pending === b.pending) continue;
-      this.lastBalances.set(b.tokenHash, { spendable: b.spendable, pending: b.pending });
-      this.emitTokenBalance(b.tokenHash, b.spendable, b.pending);
-    }
-    for (const [tokenHash, prev] of this.lastBalances) {
-      if (seen.has(tokenHash) || (prev.spendable === 0n && prev.pending === 0n)) continue;
-      this.lastBalances.set(tokenHash, { spendable: 0n, pending: 0n });
-      this.emitTokenBalance(tokenHash, 0n, 0n);
-    }
-  }
-
-  private emitTokenBalance(tokenHash: string, spendable: bigint, pending: bigint): void {
-    const payload = buildBalanceUpdate(tokenHash, spendable, pending, (h) => this.resolveTokenAddress(h));
-    if (payload === undefined) return; // unregistered token — can't resolve an address to emit
-    this.emitter.emit('balance:updated', payload);
-  }
-
-  // Resolve an owned-note token hash to its registered ERC-20 address, or undefined when the hash
-  // isn't in the SDK's token registry. Shared by `balances()` and the `balance:updated`/`note:received`
-  // emit paths so all three surfaces speak the same hash↔address mapping.
-  private resolveTokenAddress(tokenHash: string): `0x${string}` | undefined {
-    // ERC20 token hashes are self-describing (the hash IS the padded address) — resolve any pool token
-    // directly, no registry (issue #90). Non-ERC20 (NFT) hashes are out of scope and return undefined.
-    return erc20AddressFromHash(tokenHash);
+    this.events.balancesChanged(
+      this.scanState.balances(this.keyset.nullifyingKey, { currentBlock: chainHead, finalityThreshold: this.ctx.config.finalityThreshold }, this.holds.list()),
+    );
+    this.events.notesReceived(this.notes.ownedTxos(), this.notes.spentNullifiers(), this.keyset.nullifyingKey);
   }
 
   async balances(): Promise<TokenBalance[]> {
@@ -745,7 +641,7 @@ class ArmadaWallet implements Wallet {
     this.prunePendingSpends();
     const head = await this.ctx.chainClient.getBlockNumber();
     const raw = this.scanState.balances(this.keyset.nullifyingKey, { currentBlock: head, finalityThreshold: this.ctx.config.finalityThreshold }, this.holds.list());
-    return withTokenAddresses(raw, (h) => this.resolveTokenAddress(h));
+    return withTokenAddresses(raw, resolveTokenAddress);
   }
 
   spendableNullifiers(): readonly { readonly tree: number; readonly nullifier: bigint }[] {
@@ -794,7 +690,7 @@ class ArmadaWallet implements Wallet {
       shieldRelayerFees: this.scanState.shieldRelayerFees(),
       nullifyingKey: this.keyset.nullifyingKey,
       shieldedAddress: this.keyset.shieldedAddress,
-      resolveToken: (h) => this.resolveTokenAddress(h),
+      resolveToken: resolveTokenAddress,
       usdcHash: this.ctx.usdcHash,
       ...(this.ctx.config.yieldAdapterAddress !== undefined ? { yieldAdapterAddress: this.ctx.config.yieldAdapterAddress } : {}),
     });
@@ -810,199 +706,42 @@ class ArmadaWallet implements Wallet {
     });
   }
 
+  // A planner over the trees as they are now (committed state), for one planning call.
+  private planner(): SpendPlanner {
+    return new SpendPlanner(this.ctx.config, this.ctx.chainState.tree);
+  }
+
+  // The notes a spend can select: spendable, with optimistic in-flight holds pruned to their TTL and excluded.
+  private spendableTxos(): TXO[] {
+    this.prunePendingSpends();
+    return this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
+  }
+
   async planTransfer(request: PlanTransferRequest): Promise<Plan[]> {
     this.assertUsable();
     if (!this.canSpend) throw new NoSpendCapabilityError('planTransfer: wallet has no SpendSigner');
-    this.prunePendingSpends();
-    const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
-    // A fragmented transfer yields >1 group, submitted atomically as one transact([...]); each group is
-    // an independent Plan proved separately (the caller proves all, then combines the calldata).
-    return this.withMerkleProofs(planSpend(this.spendParams(request, txos, this.rootsFor(txos))));
+    return this.planner().planTransfer(request, this.spendableTxos());
   }
 
   async planTransferAfter(consolidation: readonly Plan[], request: PlanTransferRequest): Promise<PlanSelection[]> {
     this.assertUsable();
-    this.prunePendingSpends();
-    // Plan over the notes as they'd be once the consolidation confirms (its merged notes in the current
-    // tree). Planning only — the hypothetical notes can't be proved, so no merkle proofs are captured.
-    const currentTree = this.currentTree();
-    const txos = txosAfterConsolidation(
-      this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list()),
-      consolidation,
-      currentTree,
-    );
-    const roots = this.rootsFor(txos);
-    if (!roots.has(currentTree)) roots.set(currentTree, BigInt(`0x${this.scanState.treeRoot(currentTree)}`));
-    return planSpend(this.spendParams(request, txos, roots));
+    return this.planner().planTransferAfter(consolidation, request, this.spendableTxos());
   }
 
   async maxTransferAmount(request: MaxTransferRequest): Promise<bigint> {
     this.assertUsable();
-    this.prunePendingSpends();
-    const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
-    // The planner request for a transfer (`transfer` fee tier); the max probes it with its own amounts.
-    return maxTransferAmount(this.spendParams({ ...request, outputs: [] }, txos, this.rootsFor(txos)));
+    return this.planner().maxTransferAmount(request, this.spendableTxos());
   }
 
   async maxUnshieldAmount(request: MaxUnshieldRequest): Promise<bigint> {
     this.assertUsable();
-    this.prunePendingSpends();
-    const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
-    // The planner request for this unshield (at the caller's per-proof fee); the max probes its value.
-    const destination = request.unshield ?? { recipient: MAX_UNSHIELD_PROBE_RECIPIENT };
-    const params = this.spendParams(
-      {
-        outputs: [],
-        ...(request.fee !== undefined ? { fee: request.fee } : {}),
-        ...(request.tokenAddress !== undefined ? { tokenAddress: request.tokenAddress } : {}),
-        unshield: { ...destination, amount: 0n },
-      },
-      txos,
-      this.rootsFor(txos),
-    );
-    return maxUnshieldAmount({ ...params, unshield: params.unshield! });
+    return this.planner().maxUnshieldAmount(request, this.spendableTxos());
   }
 
   async consolidate(request: ConsolidateRequest): Promise<Plan[]> {
     this.assertUsable();
     if (!this.canSpend) throw new NoSpendCapabilityError('consolidate: wallet has no SpendSigner');
-    const supportedShapes = this.ctx.config.supportedShapes;
-    if (supportedShapes === undefined) {
-      throw new InvalidRequestError('consolidate: pool.supportedShapes is required (it sizes the merge groups)');
-    }
-    this.prunePendingSpends();
-    const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
-    // A consolidation is a bare transact() self-spend, priced by the relayer at the `transfer` tier, PER
-    // PROOF, always in USDC (the only token the relayer counts).
-    const fee = request.fee;
-    return this.withMerkleProofs(
-      planConsolidate({
-        txos,
-        tokenAddress: request.tokenAddress ?? this.ctx.config.usdcAddress,
-        ...(fee !== undefined && fee.perProof > 0n
-          ? {
-              fee: {
-                broadcasterShieldedAddress: fee.broadcasterShieldedAddress,
-                value: fee.perProof,
-                tokenAddress: this.ctx.config.usdcAddress,
-              },
-            }
-          : {}),
-        roots: this.rootsFor(txos),
-        currentTree: this.currentTree(),
-        chainID: BigInt(this.ctx.config.chainId),
-        supportedShapes,
-      }),
-    );
-  }
-
-  // The pool's current (latest) tree: the scan rebuilds every tree, so the highest one seen.
-  private currentTree(): number {
-    const trees = this.scanState.treeNumbers();
-    return trees.length === 0 ? 0 : Math.max(...trees);
-  }
-
-  // The current root of every tree the notes sit in, read from the same scan state the proofs come from.
-  private rootsFor(txos: readonly TXO[]): Map<number, bigint> {
-    const roots = new Map<number, bigint>();
-    for (const txo of txos) {
-      if (!roots.has(txo.tree)) roots.set(txo.tree, BigInt(`0x${this.scanState.treeRoot(txo.tree)}`));
-    }
-    return roots;
-  }
-
-  /**
-   * Reject a cross-chain (CCTP) unshield the hub pool would revert (#134), before any proving. It is cross-chain
-   * when it carries a CCTP binding, or commits `adaptParams` to anything but the yield adapter (the same test
-   * preflight uses). It must then:
-   *   - carry its decoded `adaptBinding`, so the planner can check `maxFee < value`;
-   *   - spend USDC (CCTP bridges USDC only);
-   *   - pay the pool (the final recipient is in the binding);
-   *   - name no `adaptContract`.
-   */
-  private assertCrossChainUnshield(request: PlanTransferRequest): void {
-    const unshield = request.unshield;
-    if (unshield === undefined) return;
-    const crossChain =
-      unshield.adaptBinding !== undefined ||
-      (unshield.adaptParams !== undefined &&
-        isCrossChainUnshield(
-          { adaptContract: unshield.adaptContract ?? `0x${'00'.repeat(20)}`, adaptParams: unshield.adaptParams },
-          this.ctx.config.yieldAdapterAddress,
-        ));
-    if (!crossChain) return;
-    if (unshield.adaptBinding === undefined) {
-      throw new InvalidRequestError('cross-chain unshield: needs unshield.adaptBinding (the decoded CCTP destination matching adaptParams)');
-    }
-    if (unshield.adaptContract !== undefined && BigInt(unshield.adaptContract) !== 0n) {
-      throw new InvalidRequestError('cross-chain unshield: must not name an adaptContract (the pool rejects it)');
-    }
-    if ((request.tokenAddress ?? this.ctx.config.usdcAddress).toLowerCase() !== this.ctx.config.usdcAddress.toLowerCase()) {
-      throw new InvalidRequestError('cross-chain unshield: must spend USDC (CCTP bridges USDC only)');
-    }
-    if (unshield.recipient.toLowerCase() !== this.ctx.config.poolAddress.toLowerCase()) {
-      throw new InvalidRequestError(
-        'cross-chain unshield: must pay the pool (unshield.recipient is the pool address; the final recipient is in the CCTP binding)',
-      );
-    }
-  }
-
-  /**
-   * An in-proof fee note is minted in the spent token, and the relayer only counts USDC (#115). So reject a fee on
-   * any other token's spend rather than plan one the relayer refuses after proving. A yield redeem pays its fee
-   * contract-side (omit `fee`); `consolidate` pays a non-USDC merge's fee from a separate USDC group.
-   */
-  private assertUsdcFee(request: PlanTransferRequest): void {
-    if (request.fee === undefined || request.fee.perProof <= 0n) return;
-    if ((request.tokenAddress ?? this.ctx.config.usdcAddress).toLowerCase() === this.ctx.config.usdcAddress.toLowerCase()) return;
-    throw new InvalidRequestError(
-      'a non-USDC spend can\'t carry an in-proof fee: the fee note is paid in the spent token and the relayer only ' +
-        'counts USDC. A yield redeem pays its fee contract-side (omit `fee`); merge non-USDC notes with consolidate, ' +
-        'which pays the fee from a separate USDC group.',
-    );
-  }
-
-  // The planner request for a transfer/unshield over `txos`.
-  private spendParams(request: PlanTransferRequest, txos: readonly TXO[], roots: ReadonlyMap<number, bigint>): PlanTransferParams {
-    this.assertCrossChainUnshield(request);
-    this.assertUsdcFee(request);
-    // The caller's fee is PER PROOF: a split spend pays it once per group (planSpend scales it). No fee
-    // (or zero) means no fee note.
-    const fee = request.fee;
-    return {
-      txos,
-      // Defaults to USDC; a caller can spend any pool token (e.g. yield vault shares on redeem).
-      tokenAddress: request.tokenAddress ?? this.ctx.config.usdcAddress,
-      outputs: request.outputs.map((o) => ({ toShieldedAddress: o.to0zk, value: o.amount, ...(o.memo !== undefined ? { memo: o.memo } : {}) })),
-      ...(fee !== undefined && fee.perProof > 0n ? { fee: { broadcasterShieldedAddress: fee.broadcasterShieldedAddress, value: fee.perProof } } : {}),
-      ...(request.unshield
-        ? {
-            unshield: {
-              recipient: request.unshield.recipient,
-              value: request.unshield.amount,
-              ...(request.unshield.adaptParams ? { adaptParams: request.unshield.adaptParams } : {}),
-              ...(request.unshield.adaptContract ? { adaptContract: request.unshield.adaptContract } : {}),
-              ...(request.unshield.adaptBinding ? { adaptBinding: request.unshield.adaptBinding } : {}),
-            },
-          }
-        : {}),
-      roots,
-      chainID: BigInt(this.ctx.config.chainId),
-      ...(this.ctx.config.supportedShapes !== undefined ? { supportedShapes: this.ctx.config.supportedShapes } : {}),
-      sweepNoteThreshold: this.ctx.config.sweepNoteThreshold,
-    };
-  }
-
-  // Capture each selected input's merkle proof from the SAME scan state the roots came from (no await
-  // since roots were read), so each plan owns proofs consistent with its `merkleRoot`. `prove()` uses
-  // these rather than re-reading live state, closing the plan→prove tree-append race (SPEC §4.6).
-  private withMerkleProofs(selections: readonly PlanSelection[]): Plan[] {
-    return selections.map((selection) => ({
-      ...selection,
-      merkleProofs: selection.selectedInputs.map((txo) =>
-        this.scanState.merkleProof(txo.tree, txo.position).elements.map((e) => BigInt(`0x${e}`)),
-      ),
-    }));
+    return this.planner().consolidate(request, this.spendableTxos());
   }
 
   async prove(plan: Plan, options?: ProveOptions): Promise<ProofHandle> {
@@ -1042,74 +781,9 @@ class ArmadaWallet implements Wallet {
     }
   }
 
-  // The prove() inputs for one plan: its captured witness inputs, fee-first outputs, and the bound params.
+  // The prove() inputs for one plan (see `proveParamsFor`).
   private proveParams(plan: Plan, signer: SpendSigner, options?: ProveOptions): ProveParams {
-    // Use the proofs the plan captured at plan time (NOT a fresh scan-state read) so the path elements
-    // match `plan.merkleRoot` even if a sync advanced the tree since planning (SPEC §4.6).
-    const inputs = planWitnessInputs(plan);
-    // Emit order (Spike 2): broadcaster fee note FIRST, then recipients, then change back to self. Each
-    // output carries its OutputType so sender-side recovery can tell fee/recipient/change apart later.
-    const outputs: WitnessOutputRequest[] = [];
-    if (plan.summary.feeOutput) outputs.push({ receiverAddress: plan.summary.feeOutput.toShieldedAddress, value: plan.summary.feeOutput.value, outputType: OutputType.BroadcasterFee });
-    for (const o of plan.summary.outputs) outputs.push({ receiverAddress: o.toShieldedAddress, value: o.value, outputType: OutputType.Transfer, ...(o.memo !== undefined ? { memo: o.memo } : {}) });
-    if (plan.summary.changeValue > 0n) {
-      // Optionally stash caller metadata in the change note's memo (issue #88 lever 3). The change note
-      // is self-owned, so a fresh scan recovers this on history() even after local storage is cleared.
-      const changeMemo = options?.selfMetadata !== undefined ? encodeSelfMetadata(options.selfMetadata) : undefined;
-      outputs.push({
-        receiverAddress: this.keyset.shieldedAddress,
-        value: plan.summary.changeValue,
-        outputType: OutputType.Change,
-        ...(changeMemo !== undefined ? { memo: changeMemo } : {}),
-      });
-    }
-
-    return {
-      witness: {
-        inputs,
-        outputs,
-        // The spent token comes from the plan (defaults to USDC; e.g. yield-share token on redeem).
-        tokenAddress: plan.summary.tokenAddress,
-        sender: {
-          masterPublicKey: this.keyset.masterPublicKey,
-          viewingPublicKey: this.keyset.viewingPublicKey,
-          viewingPrivateKey: this.keyset.viewingPrivateKey,
-          nullifyingKey: this.keyset.nullifyingKey,
-          spendingPublicKey: this.keyset.spendingPublicKey,
-          senderAddress: this.keyset.shieldedAddress,
-        },
-        signer,
-        summary: plan.summary,
-        merkleRoot: plan.merkleRoot,
-        treeNumber: plan.boundParams.treeNumber,
-        chainType: ChainType.EVM,
-        chainId: this.ctx.config.chainId,
-        unshield: plan.boundParams.unshield,
-        // adaptContract/adaptParams are SNARK public inputs (bound-params hash + spend signature);
-        // pass the plan's values so a cross-chain unshield's CCTP binding is committed by the proof.
-        adaptContract: plan.boundParams.adaptContract,
-        adaptParams: plan.boundParams.adaptParams,
-        // Decoded CCTP binding (inspection-only) so the signer sees the destination it authorizes (§4.2.1).
-        ...(plan.boundParams.decodedAdaptParams ? { decodedAdaptParams: plan.boundParams.decodedAdaptParams } : {}),
-        ...(plan.summary.unshield ? { unshieldOutput: plan.summary.unshield } : {}),
-      },
-      artifacts: this.ctx.artifacts,
-      prover: this.ctx.prover,
-      poolAddress: this.ctx.config.poolAddress,
-      ...(options?.expiresAt !== undefined ? { expiresAt: options.expiresAt } : {}),
-      // The public unshield preimage the contract pays out on (npk = recipient EVM address).
-      ...(plan.summary.unshield
-        ? {
-            unshieldPreimage: {
-              npk: BigInt(plan.summary.unshield.recipient),
-              tokenType: 0,
-              tokenAddress: plan.summary.tokenAddress,
-              tokenSubID: 0n,
-              value: plan.summary.unshield.value,
-            },
-          }
-        : {}),
-    };
+    return proveParamsFor(plan, this.keyset, signer, this.ctx.config, this.ctx, options);
   }
 
   async markSpendPending(plan: Plan | readonly Plan[], txid: string): Promise<void> {
