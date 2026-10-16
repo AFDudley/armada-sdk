@@ -92,6 +92,7 @@ import {
   InvalidRequestError,
   InvalidConfigError,
   QuickSyncSchemaError,
+  SignerContractViolationError,
 } from './errors';
 import { validateConfig } from './config';
 import { startAutoSync } from './sync/auto-sync';
@@ -242,6 +243,45 @@ export function quickSyncTelemetry(input: {
   };
 }
 
+// A wallet's keys without the spending PRIVATE key: the wallet only ever needs the public half (for the witness).
+// Signing is the SpendSigner's job, so the private key lives in the signer or nowhere (#140).
+type WalletKeys = Omit<Keyset, 'spendingPrivateKey'>;
+
+function withoutSpendKey(keyset: Keyset): WalletKeys {
+  return {
+    spendingPublicKey: keyset.spendingPublicKey,
+    viewingPublicKey: keyset.viewingPublicKey,
+    viewingPrivateKey: keyset.viewingPrivateKey,
+    nullifyingKey: keyset.nullifyingKey,
+    masterPublicKey: keyset.masterPublicKey,
+    shieldedAddress: keyset.shieldedAddress,
+  };
+}
+
+// The signer a factory attaches to a freshly derived keyset, leaving at most one copy of the spend key: a LocalSigner
+// takes the derived buffer as its own; with an explicit signer, or view-only, the derived key is zeroed at once.
+async function signerFor(keyset: Keyset, opts: { signer?: SpendSigner; viewOnly?: boolean }): Promise<SpendSigner | undefined> {
+  if (opts.signer !== undefined) {
+    keyset.spendingPrivateKey.fill(0);
+    await assertSignerHoldsKey(opts.signer, keyset.spendingPublicKey);
+    return opts.signer;
+  }
+  if (opts.viewOnly === true) {
+    keyset.spendingPrivateKey.fill(0);
+    return undefined;
+  }
+  return LocalSigner.fromKeyset(keyset);
+}
+
+// A signer must hold the wallet's spending key: one that doesn't would be accepted as `canSpend`, then fail as an
+// opaque circuit error after its signatures were released (#140).
+async function assertSignerHoldsKey(signer: SpendSigner, spendingPublicKey: readonly [bigint, bigint]): Promise<void> {
+  const [x, y] = await signer.getSpendingPublicKey();
+  if (x !== spendingPublicKey[0] || y !== spendingPublicKey[1]) {
+    throw new SignerContractViolationError("the SpendSigner's spending public key isn't this wallet's");
+  }
+}
+
 // The storage layout version, part of the deployment namespace: a store written under another version is reset
 // (chain-derived records wiped and rebuilt by a rescan). 2: wallet records moved under per-wallet scopes (#138).
 const STORAGE_SCHEMA_VERSION = 2;
@@ -385,7 +425,7 @@ class ArmadaWallet implements Wallet {
   private watchStop: Unsubscribe | undefined;
 
   constructor(
-    private readonly keyset: Keyset,
+    private readonly keyset: WalletKeys,
     private readonly creationBlock: number,
     private readonly signer: SpendSigner | undefined,
     private readonly ctx: SdkContext,
@@ -1402,41 +1442,42 @@ export async function createArmadaSdk(config: ArmadaSdkConfig): Promise<ArmadaSd
     async fromRootSecret(rootSecret, opts) {
       const keyset = await deriveKeyset(rootSecret);
       // Spend-capable by default: an explicit `signer` wins; else `viewOnly` opts out of spend entirely;
-      // else auto-derive a LocalSigner (the rootSecret already grants spend power, so withholding it
+      // else a LocalSigner over the derived key (the rootSecret already grants spend power, so withholding it
       // buys no security — the least-privilege path is a view-only wallet from a viewing key).
-      const signer = opts.signer ?? (opts.viewOnly === true ? undefined : await LocalSigner.fromRootSecret(rootSecret));
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, signer, ctx));
+      const signer = await signerFor(keyset, opts);
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), opts.creationBlock, signer, ctx));
     },
     async fromMnemonic(mnemonic, opts) {
       const index = opts.derivationIndex ?? 0;
       // deriveKeysetFromMnemonic validates the BIP-39 checksum. Spend-capable by default (like
-      // fromRootSecret): explicit signer wins, `viewOnly` opts out, else auto-derive a LocalSigner.
+      // fromRootSecret): explicit signer wins, `viewOnly` opts out, else a LocalSigner over the derived key.
       const keyset = await deriveKeysetFromMnemonic(mnemonic, index);
-      const signer = opts.signer ?? (opts.viewOnly === true ? undefined : await LocalSigner.fromMnemonic(mnemonic, index));
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, signer, ctx));
+      const signer = await signerFor(keyset, opts);
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), opts.creationBlock, signer, ctx));
     },
     // Ephemeral (claimable payments, SPEC §6): in-memory, never persisted, auto-attaches a signer so
     // the claiming flow can spend. `seed` is the claim's 32-byte root; scans from the pool's deploy
     // block (block 0 would force a multi-million-block getLogs that public RPCs reject).
     async ephemeralFromSeed(seed) {
       const keyset = await deriveKeyset(seed);
-      const signer = await LocalSigner.fromRootSecret(seed);
-      return loaded(new ArmadaWallet(keyset, config.pool.deployBlock, signer, ctx, true));
+      const signer = LocalSigner.fromKeyset(keyset);
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), config.pool.deployBlock, signer, ctx, true));
     },
     async viewOnlyFromViewingKey(shareableViewingKey, opts) {
       const { viewingPrivateKey, spendingPublicKey } = decodeShareableViewingKey(shareableViewingKey);
       const identity = await deriveViewOnlyIdentity(viewingPrivateKey, spendingPublicKey);
-      // View-only: no spending PRIVATE key, no signer → spend-path calls throw NoSpendCapabilityError.
-      const keyset: Keyset = {
+      // No spending private key here at all. Spend-capable only with a `signer` (e.g. over an HSM), which must hold
+      // this wallet's spending key; without one, spend-path calls throw NoSpendCapabilityError.
+      const keys: WalletKeys = {
         spendingPublicKey,
-        spendingPrivateKey: new Uint8Array(0),
         viewingPublicKey: identity.viewingPublicKey,
         viewingPrivateKey,
         nullifyingKey: identity.nullifyingKey,
         masterPublicKey: identity.masterPublicKey,
         shieldedAddress: identity.shieldedAddress,
       };
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, undefined, ctx));
+      if (opts.signer !== undefined) await assertSignerHoldsKey(opts.signer, spendingPublicKey);
+      return loaded(new ArmadaWallet(keys, opts.creationBlock, opts.signer, ctx));
     },
   };
 

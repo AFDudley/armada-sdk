@@ -10,6 +10,7 @@ import {
   getTokenDataHash,
   decodeAddress,
   OutputType,
+  verifyEDDSA,
 } from '../core/index';
 import { createTransferNote, encryptNoteToReceiver, type CommitmentCiphertextV2 } from '../sync/index';
 import { SignerContractViolationError } from '../errors';
@@ -191,6 +192,16 @@ export async function buildWitness(params: BuildWitnessParams): Promise<BuiltWit
   return prepared.finalize(signature);
 }
 
+// Whether `signature` is a valid EdDSA (Poseidon) signature of `message` under `publicKey`. A malformed signature (e.g. a
+// point off the curve) makes the verifier throw; that's a bad signature too.
+function signatureVerifies(message: bigint, signature: EddsaSignature, publicKey: readonly [bigint, bigint]): boolean {
+  try {
+    return verifyEDDSA(message, { R8: [signature.R8[0], signature.R8[1]], S: signature.S }, [publicKey[0], publicKey[1]]);
+  } catch {
+    return false;
+  }
+}
+
 /** A witness assembled up to the spend-auth signature: the intent to sign, and how to finish once signed. */
 export interface PreparedWitness {
   /** The fully-bound intent for the `SpendSigner` (SPEC §4.2.1). */
@@ -280,6 +291,13 @@ export async function prepareWitness(params: Omit<BuildWitnessParams, 'signer'>)
   };
 
   const finalize = (signature: EddsaSignature): BuiltWitness => {
+    // Check the signature before it goes anywhere near the prover: a bad one would only surface as an opaque circuit
+    // failure after ~30s of proving (#140).
+    if (!signatureVerifies(message, signature, params.sender.spendingPublicKey)) {
+      throw new SignerContractViolationError(
+        "the SpendSigner returned a signature that doesn't verify against the wallet's spending public key",
+      );
+    }
     const formattedInputs: FormattedCircuitInputs = {
       merkleRoot: params.merkleRoot,
       boundParamsHash,

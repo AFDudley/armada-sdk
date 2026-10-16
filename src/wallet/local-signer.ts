@@ -2,7 +2,7 @@
 // ABOUTME: derived from a rootSecret. Signs each intent digest with BabyJubjub EdDSA via core.
 
 import { signEDDSA } from '../core/index';
-import { deriveKeyset, deriveKeysetFromMnemonic } from './derive';
+import { deriveKeyset, deriveKeysetFromMnemonic, type Keyset } from './derive';
 import { InvalidRequestError } from '../errors';
 import type { SpendSigner, SpendSignRequest, EddsaSignature } from './index';
 
@@ -18,6 +18,14 @@ export class LocalSigner implements SpendSigner {
     private readonly spendingPrivateKey: Uint8Array,
     private readonly spendingPublicKey: [bigint, bigint],
   ) {}
+
+  /**
+   * A signer over an already-derived keyset's spend key. It takes the keyset's `spendingPrivateKey` buffer as its own
+   * (no copy), so `dispose()` zeroes the only copy of the key — the wallet doesn't keep one.
+   */
+  static fromKeyset(keyset: Keyset): LocalSigner {
+    return new LocalSigner(keyset.spendingPrivateKey, keyset.spendingPublicKey);
+  }
 
   static async fromRootSecret(rootSecret: Uint8Array): Promise<LocalSigner> {
     const keyset = await deriveKeyset(rootSecret);

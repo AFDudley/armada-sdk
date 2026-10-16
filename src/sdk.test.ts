@@ -16,14 +16,14 @@ import {
   buildReceivedNote,
 } from './sdk';
 import { RootMismatchError, QuickSyncSchemaError, IndexerHttpError, PositionGapError } from './errors';
-import { deriveKeyset, LocalSigner } from './wallet/index';
+import { deriveKeyset, LocalSigner, ExternalSigner, encodeShareableViewingKey, type Wallet } from './wallet/index';
 import { saveScanState, WalletScanState, walletRecordId } from './internal/index';
 import { MemoryStorageAdapter } from './storage/index';
-import { NoSpendCapabilityError, InvalidKeyMaterialError, InvalidRequestError, UnsupportedCircuitShapeError } from './errors';
+import { NoSpendCapabilityError, InvalidKeyMaterialError, InvalidRequestError, UnsupportedCircuitShapeError, SignerContractViolationError } from './errors';
 import { initPoseidonPromise, Mnemonic, getTokenDataERC20, getTokenDataHash } from './core/index';
 import { feeForOperation, encodeCctpBinding } from './tx/index';
 import type { ProverAdapter, ArtifactSource, ArtifactSet, Groth16Proof } from './prover/index';
-import type { ArmadaSdkConfig } from './index';
+import type { ArmadaSdk, ArmadaSdkConfig } from './index';
 import type { Plan } from './tx/index';
 
 const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' as const;
@@ -31,8 +31,12 @@ const seed = (fill: number): Uint8Array => new Uint8Array(32).fill(fill);
 
 // A prover/artifacts stub — the lifecycle tests never prove, but close() must reach prover.close().
 let proverClosed = false;
+let proveCalls = 0;
 const stubProver: ProverAdapter = {
-  prove: async (): Promise<Groth16Proof> => ({ a: ['0', '0'], b: [['0', '0'], ['0', '0']], c: ['0', '0'] }),
+  prove: async (): Promise<Groth16Proof> => {
+    proveCalls += 1;
+    return { a: ['0', '0'], b: [['0', '0'], ['0', '0']], c: ['0', '0'] };
+  },
   verify: async () => true,
   close: async () => { proverClosed = true; },
 };
@@ -679,6 +683,8 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
     notesByTree: Record<number, bigint[]>,
     shapes: string[] | null = SHAPES,
     poolOptions: Partial<ArmadaSdkConfig['pool']> = {},
+    // How the test loads its wallet (the seeded notes belong to seed 0x55's viewing key).
+    load: (sdk: ArmadaSdk) => Promise<Wallet> = (sdk) => sdk.wallet.fromRootSecret(seed(0x55), { creationBlock: 1 }),
   ) {
     await initPoseidonPromise;
     const store = new MemoryStorageAdapter();
@@ -703,9 +709,57 @@ describe('wallet.consolidate + planTransferAfter (issue #98)', () => {
       storage: store,
       dangerouslyAllowPlaintextStorage: true,
     });
-    const wallet = await sdk.wallet.fromRootSecret(seed(0x55), { creationBlock: 1 }); // loads the saved scan state
+    const wallet = await load(sdk); // loads the saved scan state
     return { sdk, wallet };
   }
+
+  describe('custody (#140)', () => {
+    // An ExternalSigner standing in for an HSM: it reports `publicFrom`'s spending key and signs with `signWith`'s.
+    async function externalSigner(publicFrom: number, signWith = publicFrom): Promise<ExternalSigner> {
+      const reporter = await LocalSigner.fromRootSecret(seed(publicFrom));
+      const signer = await LocalSigner.fromRootSecret(seed(signWith));
+      return new ExternalSigner((requests) => signer.signBatch(requests), () => reporter.getSpendingPublicKey());
+    }
+    const viewingKeyOf = async (fill: number): Promise<string> => {
+      const k = await deriveKeyset(seed(fill));
+      return encodeShareableViewingKey({ viewingPrivateKey: k.viewingPrivateKey, spendingPublicKey: k.spendingPublicKey });
+    };
+    const recipient = async (): Promise<string> => (await deriveKeyset(seed(0x66))).shieldedAddress;
+
+    it('spends from a viewing key plus an external signer, so the SDK never sees the root secret', async () => {
+      // WHY: an external signer could only be attached to a wallet built from the root secret or mnemonic, so the SDK
+      // derived (and held) the spend key anyway. A viewing key + signer keeps the spend key out of the process.
+      const signer = await externalSigner(0x55);
+      const svk = await viewingKeyOf(0x55);
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] }, SHAPES, {}, (s) => s.wallet.viewOnlyFromViewingKey(svk, { creationBlock: 1, signer }));
+      expect(wallet.canSpend).toBe(true);
+      const plans = await wallet.planTransfer({ outputs: [{ to0zk: await recipient(), amount: 5n }] });
+      await expect(wallet.proveAll(plans)).resolves.toHaveLength(1);
+      await sdk.close();
+    });
+
+    it("rejects, at load, a signer whose key isn't the wallet's", async () => {
+      // WHY: the signer's key was never checked. A wrong-key signer was accepted as canSpend, and failed only as an
+      // opaque circuit error after ~30s of proving, with its signatures already released.
+      const wrong = await externalSigner(0x66);
+      await expect(walletWithNotes({ 0: [20n] }, SHAPES, {}, (s) => s.wallet.fromRootSecret(seed(0x55), { creationBlock: 1, signer: wrong })))
+        .rejects.toBeInstanceOf(SignerContractViolationError);
+      const svk = await viewingKeyOf(0x55);
+      await expect(walletWithNotes({ 0: [20n] }, SHAPES, {}, (s) => s.wallet.viewOnlyFromViewingKey(svk, { creationBlock: 1, signer: wrong })))
+        .rejects.toBeInstanceOf(SignerContractViolationError);
+    });
+
+    it("verifies every signature before proving: a signature that doesn't match the wallet's key fails fast", async () => {
+      const lying = await externalSigner(0x55, 0x66); // reports the right key, signs with another
+      proveCalls = 0;
+      const { sdk, wallet } = await walletWithNotes({ 0: [20n] }, SHAPES, {}, (s) => s.wallet.fromRootSecret(seed(0x55), { creationBlock: 1, signer: lying }));
+      const plans = await wallet.planTransfer({ outputs: [{ to0zk: await recipient(), amount: 5n }] });
+      await expect(wallet.proveAll(plans)).rejects.toBeInstanceOf(SignerContractViolationError);
+      await expect(wallet.prove(plans[0]!)).rejects.toBeInstanceOf(SignerContractViolationError);
+      expect(proveCalls).toBe(0); // rejected before any proving
+      await sdk.close();
+    });
+  });
 
   // A cross-chain (CCTP) unshield destination the pool accepts: it pays the pool (`0x11…`, the test pool), and its
   // decoded binding matches its adaptParams. Callers override fields to break one rule at a time.

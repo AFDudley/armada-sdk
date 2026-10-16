@@ -232,7 +232,11 @@ export interface WalletFactory {
    * Load a wallet from its rootSecret. Spend-capable by DEFAULT (SPEC §4.2.1: `LocalSigner` is the
    * default) — the SDK derives a `LocalSigner` internally, since the rootSecret already grants spend
    * power. Pass `signer` to attach a different signer (e.g. `ExternalSigner`), or `viewOnly: true` for
-   * a view-only wallet from a rootSecret (no spend key held; spend-path calls throw NoSpendCapabilityError).
+   * a view-only wallet from a rootSecret (the derived spend key is zeroed at once; spend-path calls throw
+   * NoSpendCapabilityError). A `signer` must hold this wallet's spending key: one whose
+   * `getSpendingPublicKey()` differs is rejected with `SignerContractViolationError` before the wallet loads.
+   * Deriving from the root secret puts the spend key in the SDK briefly even with an external signer; to keep
+   * it out entirely, use `viewOnlyFromViewingKey` with a signer.
    *
    * `creationBlock` is where the wallet starts looking for its notes; the merkle tree is always built from
    * the pool's deploy block, so a later value never breaks syncing. Pass the deploy block when the same
@@ -253,8 +257,13 @@ export interface WalletFactory {
     mnemonic: string,
     opts: { creationBlock: number; signer?: SpendSigner; viewOnly?: boolean; derivationIndex?: number },
   ): Promise<Wallet>;
-  /** View-only: full scan/balance/disclosure, no spend (spend-path calls throw NoSpendCapabilityError). */
-  viewOnlyFromViewingKey(shareableViewingKey: string, opts: { creationBlock: number }): Promise<Wallet>;
+  /**
+   * From a shareable viewing key: full scan/balance/history. View-only by default (spend-path calls throw
+   * NoSpendCapabilityError). Pass `signer` (e.g. an `ExternalSigner` over an HSM or policy service) to make it
+   * spend-capable while the spend key never enters the SDK — the only way to spend without the SDK seeing the
+   * root secret.
+   */
+  viewOnlyFromViewingKey(shareableViewingKey: string, opts: { creationBlock: number; signer?: SpendSigner }): Promise<Wallet>;
 }
 
 // Implementations.
