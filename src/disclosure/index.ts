@@ -23,6 +23,10 @@ export type {
   Hop4,
   Hop5,
   Hop6,
+  Hop7,
+  AttributionClaim,
+  SignedChannelState,
+  ChannelStatesEntry,
   DisclosurePackage,
 } from './types';
 
@@ -47,6 +51,16 @@ export {
   disclosurePublicSignals,
 } from './circuit';
 export type { DisclosureCircuitInput, DisclosureSigningKeys } from './circuit';
+
+// go-nitro state-channel primitives (H7) — channel id, state hash, ECDSA signer recovery.
+export { getChannelId, hashNitroState, recoverNitroSigner, participantDestination } from './nitro';
+export type {
+  NitroAllocation,
+  NitroAssetMetadata,
+  NitroSingleAssetExit,
+  NitroFixedPart,
+  NitroVariablePart,
+} from './nitro';
 
 // Builder.
 export { buildDisclosurePackage } from './builder';
@@ -83,6 +97,7 @@ export type {
   DisclosureCheckFailure,
   DisclosureCheckName,
   DisclosureLearned,
+  AllocationChange,
 } from './checker';
 
 // Serialization.

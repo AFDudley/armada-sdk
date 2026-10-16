@@ -5,15 +5,19 @@ import { AbiCoder, keccak256, getAddress } from 'ethers';
 import { ShieldNote, getTokenDataHash } from '../core/index';
 import type { ProverAdapter } from '../prover/index';
 import { hashHops, statementHashField, verifyEndpointSignature } from './statement';
-import type { DisclosureChainSource, EventScope } from './chain-source';
+import type { DisclosureChainSource, EventScope, HubFinalizedOutcomeRecord } from './chain-source';
+import { getChannelId, hashNitroState, recoverNitroSigner, participantDestination } from './nitro';
 import {
   DISCLOSURE_PACKAGE_VERSION,
   SHIELD_ALLOCATION_TYPE,
+  type ChannelStatesEntry,
   type CommitmentLocation,
   type DisclosurePackage,
   type DisclosureProofEntry,
   type Hop,
+  type Hop7,
   type NoteOpening,
+  type SignedChannelState,
 } from './types';
 
 /** The name of each check the verifier runs; a failure reports exactly one of these. */
@@ -38,7 +42,17 @@ export type DisclosureCheckName =
   | 'unshield-event'
   | 'event-chain-mismatch'
   | 'event-contract-mismatch'
-  | 'missing-adjudicator';
+  | 'missing-adjudicator'
+  | 'attribution-claim'
+  | 'attribution-participant'
+  | 'channel-states'
+  | 'channel-id'
+  | 'state-signatures'
+  | 'state-turn-order'
+  | 'attribution-first-state'
+  | 'attribution-finalized'
+  | 'unexpected-channel-states'
+  | 'missing-attribution-hop';
 
 export interface DisclosureCheckFailure {
   readonly check: DisclosureCheckName;
@@ -47,12 +61,25 @@ export interface DisclosureCheckFailure {
   readonly detail: string;
 }
 
+/** One change to a user's channel allocation that an attribution reports. */
+export interface AllocationChange {
+  readonly channelId: string;
+  /** The turn number of the state after the change. */
+  readonly turnNum: number;
+  readonly asset: string;
+  /** The user's allocation amount before and after, decimal strings. */
+  readonly before: string;
+  readonly after: string;
+}
+
 /** What a verifier learns from a package that passes every check. */
 export interface DisclosureLearned {
   readonly masterPublicKey: string;
   readonly endpoints: readonly { role: string; account: string }[];
   readonly transactionIds: readonly string[];
   readonly channelIds: readonly string[];
+  /** The user's allocation changes per attributed channel (D20.5). Empty when nothing is claimed. */
+  readonly attributions: readonly AllocationChange[];
 }
 
 export interface DisclosureCheckResult {
@@ -116,6 +143,14 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
   const expectedChainId = pkg.domain.chainId;
   const poolContract = pkg.domain.verifyingContract;
   const adjudicator = pkg.statement.adjudicator;
+
+  // Attribution (ADR-0020 D20.5). Without a claim the package carries no channel states and no H7 hop.
+  const channelStatesById = new Map((pkg.channelStates ?? []).map((c) => [c.channelId.toLowerCase(), c]));
+  const attributedChannels = new Set<string>();
+  const attributionChanges: AllocationChange[] = [];
+  if (pkg.statement.attributions.length === 0 && ((pkg.channelStates?.length ?? 0) > 0 || pkg.hops.some((h) => h.kind === 'H7'))) {
+    return failure('unexpected-channel-states', 'statement claims no attribution but the package carries channel states');
+  }
 
   // True when an event's scope is the statement's chain and the given contract.
   const inScope = (scope: EventScope, contract: string): boolean =>
@@ -355,6 +390,32 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
         transactionIds.add(hop.unshieldTxid);
         return null;
       }
+      case 'H7': {
+        const adjErr = requireAdjudicator(i);
+        if (adjErr !== null) return adjErr;
+        const claim = pkg.statement.attributions.find((a) => addressesEqual(a.channelId, hop.channelId));
+        if (claim === undefined) {
+          return failure('attribution-claim', `no attribution claim for channel ${hop.channelId}`, i);
+        }
+        if (!addressesEqual(claim.participant, hop.participant)) {
+          return failure('attribution-claim', `H7 participant ${hop.participant} is not the claim participant`, i);
+        }
+        const endpoint = pkg.statement.endpoints.find((e) => addressesEqual(e.account, hop.participant));
+        if (endpoint === undefined) {
+          return failure('attribution-participant', `participant ${hop.participant} is not a signed endpoint`, i);
+        }
+        const entry = channelStatesById.get(hop.channelId.toLowerCase());
+        if (entry === undefined) {
+          return failure('channel-states', `no channel states for channel ${hop.channelId}`, i);
+        }
+        const statesErr = await checkChannelStates(hop, entry, i);
+        if (statesErr !== null) return statesErr;
+        attributedChannels.add(hop.channelId.toLowerCase());
+        channelIds.add(hop.channelId);
+        transactionIds.add(hop.depositTxid);
+        transactionIds.add(hop.concludeTxid);
+        return null;
+      }
     }
   }
 
@@ -382,6 +443,105 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
     return null;
   }
 
+  // The user's allocation amount for `asset` in one state, or undefined when the state has none.
+  function userAllocationAmount(state: SignedChannelState, asset: string, userDest: string): bigint | undefined {
+    const exit = state.outcome.find((e) => addressesEqual(e.asset, asset));
+    const alloc = exit?.allocations.find((a) => addressesEqual(a.destination, userDest));
+    return alloc === undefined ? undefined : BigInt(alloc.amount);
+  }
+
+  // The last state's outcome for the finalized asset must equal the on-chain finalized allocations.
+  function lastStateMatchesOutcome(last: SignedChannelState, outcome: HubFinalizedOutcomeRecord): boolean {
+    const exit = last.outcome.find((e) => addressesEqual(e.asset, outcome.asset));
+    if (exit === undefined || exit.allocations.length !== outcome.allocations.length) return false;
+    return exit.allocations.every((a, k) => {
+      const b = outcome.allocations[k]!;
+      return addressesEqual(a.destination, b.destination) && BigInt(a.amount) === BigInt(b.amount) && a.allocationType === b.allocationType;
+    });
+  }
+
+  // Record each change to the user's allocation across the channel's states, per asset.
+  function recordAllocationChanges(channelId: string, entry: ChannelStatesEntry, userDest: string): void {
+    const assets = new Set(entry.states.flatMap((st) => st.outcome.map((e) => e.asset)));
+    for (const asset of assets) {
+      let prev: bigint | undefined;
+      for (const st of entry.states) {
+        const amt = userAllocationAmount(st, asset, userDest);
+        if (prev !== undefined && amt !== undefined && amt !== prev) {
+          attributionChanges.push({ channelId, turnNum: st.turnNum, asset, before: prev.toString(), after: amt.toString() });
+        }
+        if (amt !== undefined) prev = amt;
+      }
+    }
+  }
+
+  // The five H7 checks (ADR-0020, engineering/16): the fixed part gives the channel id; every state is
+  // signed by all participants; the turn numbers increase; the first state allocates the deposit to the
+  // user; the last state's outcome equals the finalized outcome.
+  async function checkChannelStates(hop: Hop7, entry: ChannelStatesEntry, i: number): Promise<DisclosureCheckResult | null> {
+    const derivedId = getChannelId(entry.fixedPart);
+    if (!addressesEqual(derivedId, hop.channelId)) {
+      return failure('channel-id', `channel states fixedPart id ${derivedId} != hop channel ${hop.channelId}`, i);
+    }
+    const participants = entry.fixedPart.participants;
+    const partIdx = participants.findIndex((p) => addressesEqual(p, hop.participant));
+    if (partIdx < 0) {
+      return failure('channel-states', `participant ${hop.participant} is not in channel ${hop.channelId}`, i);
+    }
+    if (entry.states.length === 0) {
+      return failure('channel-states', `channel ${hop.channelId} has no states`, i);
+    }
+    let prevTurn = -1;
+    for (const st of entry.states) {
+      if (st.sigs.length !== participants.length) {
+        return failure('state-signatures', `state turn ${st.turnNum} is missing a participant signature`, i);
+      }
+      if (st.turnNum <= prevTurn) {
+        return failure('state-turn-order', `state turn ${st.turnNum} does not increase`, i);
+      }
+      prevTurn = st.turnNum;
+      const stateHash = hashNitroState(derivedId, { outcome: st.outcome, appData: st.appData, turnNum: st.turnNum, isFinal: st.isFinal });
+      for (let p = 0; p < participants.length; p++) {
+        const sig = st.sigs[p]!;
+        if (p === partIdx) {
+          if (!addressesEqual(recoverNitroSigner(stateHash, sig), participants[p]!)) {
+            return failure('state-signatures', `user signature invalid at turn ${st.turnNum}`, i);
+          }
+        } else {
+          const ok = await params.source.hubSignatureValid({ chainId: expectedChainId, custodian: participants[p]!, stateHash, signature: sig, blockNumber: hop.hubActiveBlock });
+          if (!ok) {
+            return failure('state-signatures', `hub signature invalid at turn ${st.turnNum}`, i);
+          }
+        }
+      }
+    }
+    const deposit = params.source.depositsIn(hop.depositTxid).find((d) => addressesEqual(d.channelId, hop.channelId) && inScope(d, adjudicator));
+    if (deposit === undefined) {
+      return failure('attribution-first-state', `no in-scope deposit for channel ${hop.channelId} in ${hop.depositTxid}`, i);
+    }
+    const userDest = participantDestination(hop.participant);
+    const firstAmt = userAllocationAmount(entry.states[0]!, hop.asset, userDest);
+    if (firstAmt === undefined || firstAmt !== BigInt(deposit.held)) {
+      return failure('attribution-first-state', `first state does not allocate the deposit amount ${deposit.held} to the user`, i);
+    }
+    const outcome = params.source.finalizedOutcomesIn(hop.concludeTxid).find((o) => addressesEqual(o.channelId, hop.channelId) && inScope(o, adjudicator));
+    if (outcome === undefined) {
+      return failure('attribution-finalized', `no in-scope finalized outcome for channel ${hop.channelId} in ${hop.concludeTxid}`, i);
+    }
+    if (!lastStateMatchesOutcome(entry.states[entry.states.length - 1]!, outcome)) {
+      return failure('attribution-finalized', `last state outcome does not equal the finalized outcome of channel ${hop.channelId}`, i);
+    }
+    recordAllocationChanges(hop.channelId, entry, userDest);
+    return null;
+  }
+
+  // Every claimed attribution must be backed by an H7 hop that the loop verified.
+  for (const a of pkg.statement.attributions) {
+    if (!attributedChannels.has(a.channelId.toLowerCase())) {
+      return failure('missing-attribution-hop', `attribution for channel ${a.channelId} has no H7 hop`);
+    }
+  }
+
   return {
     ok: true,
     learned: {
@@ -389,6 +549,7 @@ export async function checkDisclosurePackage(params: CheckDisclosureParams): Pro
       endpoints: pkg.statement.endpoints.map((e) => ({ role: e.role, account: e.account })),
       transactionIds: [...transactionIds],
       channelIds: [...channelIds],
+      attributions: attributionChanges,
     },
   };
 }

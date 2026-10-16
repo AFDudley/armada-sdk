@@ -29,11 +29,16 @@ export const DISCLOSURE_EIP712_TYPES: Record<string, TypedDataField[]> = {
     { name: 'issuedAt', type: 'uint64' },
     { name: 'endpoints', type: 'Endpoint[]' },
     { name: 'adjudicator', type: 'address' },
+    { name: 'attributions', type: 'Attribution[]' },
     { name: 'hopsHash', type: 'bytes32' },
   ],
   Endpoint: [
     { name: 'role', type: 'string' },
     { name: 'account', type: 'address' },
+  ],
+  Attribution: [
+    { name: 'channelId', type: 'bytes32' },
+    { name: 'participant', type: 'address' },
   ],
 };
 
@@ -56,6 +61,7 @@ export function statementMessage(statement: DisclosureStatement): Record<string,
     issuedAt: statement.issuedAt,
     endpoints: statement.endpoints.map((e) => ({ role: e.role, account: e.account })),
     adjudicator: statement.adjudicator,
+    attributions: statement.attributions.map((a) => ({ channelId: a.channelId, participant: a.participant })),
     hopsHash: statement.hopsHash,
   };
 }

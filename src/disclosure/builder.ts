@@ -16,6 +16,8 @@ import {
 import { disclosurePublicSignals, formatDisclosureInput, type DisclosureSigningKeys } from './circuit';
 import {
   DISCLOSURE_PACKAGE_VERSION,
+  type AttributionClaim,
+  type ChannelStatesEntry,
   type DisclosureDomain,
   type DisclosurePackage,
   type DisclosureProofEntry,
@@ -62,6 +64,10 @@ export interface BuildDisclosureParams {
   readonly endpoints: readonly { role: string; account: string }[];
   /** The armada-nitro adjudicator address, required when the hops include H4, H5 or H7 (D20.6). */
   readonly adjudicator?: string;
+  /** The attribution claims (D20.5); when set, `channelStates` must carry the co-signed states. */
+  readonly attributions?: readonly AttributionClaim[];
+  /** The co-signed channel states that H7 verifies; present only with an attribution claim. */
+  readonly channelStates?: readonly ChannelStatesEntry[];
   readonly openings: readonly BuilderOpening[];
   readonly spends: readonly BuilderSpend[];
   readonly hops: readonly Hop[];
@@ -101,6 +107,7 @@ export async function buildDisclosurePackage(params: BuildDisclosureParams): Pro
     issuedAt,
     endpoints: params.endpoints.map((e) => ({ role: e.role, account: e.account })),
     adjudicator: params.adjudicator ?? ZeroAddress,
+    attributions: (params.attributions ?? []).map((a) => ({ channelId: a.channelId, participant: a.participant })),
     hopsHash: hashHops(params.hops),
   };
 
@@ -138,6 +145,9 @@ export async function buildDisclosurePackage(params: BuildDisclosureParams): Pro
     });
     endpointSignatures.push({ role: endpoint.role, account: endpoint.account, signature });
   }
+  // The package is a JSON wire format, so channel-state amounts and the channel nonce are stored as
+  // decimal strings (a caller may pass them as bigint for convenience).
+  const channelStates = params.channelStates?.map(jsonSafeChannelStates);
 
   return {
     version: DISCLOSURE_PACKAGE_VERSION,
@@ -147,5 +157,20 @@ export async function buildDisclosurePackage(params: BuildDisclosureParams): Pro
     openings,
     proofs,
     hops: params.hops,
+    ...(channelStates !== undefined ? { channelStates } : {}),
+  };
+}
+
+function jsonSafeChannelStates(entry: ChannelStatesEntry): ChannelStatesEntry {
+  return {
+    channelId: entry.channelId,
+    fixedPart: { ...entry.fixedPart, channelNonce: String(entry.fixedPart.channelNonce) },
+    states: entry.states.map((s) => ({
+      ...s,
+      outcome: s.outcome.map((e) => ({
+        ...e,
+        allocations: e.allocations.map((a) => ({ ...a, amount: String(a.amount) })),
+      })),
+    })),
   };
 }

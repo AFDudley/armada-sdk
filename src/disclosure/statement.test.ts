@@ -30,6 +30,7 @@ function makeStatement(account: string): DisclosureStatement {
     issuedAt: 1_700_000_000,
     endpoints: [{ role: 'shielder', account }],
     adjudicator: `0x${'00'.repeat(20)}`,
+    attributions: [],
     hopsHash: hashHops(hops),
   };
 }

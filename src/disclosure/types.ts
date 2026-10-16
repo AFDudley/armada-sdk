@@ -3,6 +3,8 @@
 
 import type { TokenData } from '../core/index';
 import type { Groth16Proof } from '../prover/index';
+import type { NitroFixedPart, NitroSingleAssetExit } from './nitro';
+import type { NitroSignature } from './chain-source';
 
 /** The BN254 scalar field prime `r`. Every disclosure field element is reduced mod this value. */
 export const SNARK_SCALAR_FIELD =
@@ -34,6 +36,13 @@ export interface DisclosureEndpoint {
   readonly account: string;
 }
 
+/** An attribution claim (ADR-0020 D20.5): the statement claims how one channel's gain arose. */
+export interface AttributionClaim {
+  /** The channel id the claim covers, 0x-prefixed `bytes32`. */
+  readonly channelId: string;
+  /** The user's channel participant address; it also signs the statement as an endpoint. */
+  readonly participant: string;
+}
 /**
  * The signed statement S (EIP-712 `Statement`). It names the wallet (`masterPublicKey`), the audit
  * recipient (`verifier`), the purpose (`context`), the public endpoints and a hash of the hop list.
@@ -49,6 +58,8 @@ export interface DisclosureStatement {
   readonly endpoints: readonly DisclosureEndpoint[];
   /** The armada-nitro adjudicator address (EIP-712 `address`); the zero address when no channel hop. */
   readonly adjudicator: string;
+  /** The channels whose gain the statement attributes (D20.5); empty when it claims none. */
+  readonly attributions: readonly AttributionClaim[];
   /** `keccak256` of the canonical hop list (EIP-712 `bytes32`, 0x-prefixed). */
   readonly hopsHash: string;
 }
@@ -167,7 +178,44 @@ export interface Hop6 {
   readonly unshieldTxid: string;
 }
 
-export type Hop = Hop1 | Hop2 | Hop3 | Hop4 | Hop5 | Hop6;
+/**
+ * H7 · a channel's gain is attributed (ADR-0020 D20.5). The package carries the channel's co-signed
+ * states; the hop links them to the H4 deposit and the H5 finalized outcome.
+ */
+export interface Hop7 {
+  readonly kind: 'H7';
+  readonly channelId: string;
+  /** The user's channel participant address (also a signed endpoint). */
+  readonly participant: string;
+  /** The deposited asset whose first-state allocation to the user must equal the H4 deposit. */
+  readonly asset: string;
+  /** The H4 deposit transaction (its held amount is the first state's user allocation). */
+  readonly depositTxid: string;
+  /** The H5 conclude transaction (its finalized outcome must equal the last state's outcome). */
+  readonly concludeTxid: string;
+  /** A block where the hub's delegate was active, for the hub's EIP-1271 signature check. */
+  readonly hubActiveBlock: number;
+}
+
+export type Hop = Hop1 | Hop2 | Hop3 | Hop4 | Hop5 | Hop6 | Hop7;
+
+/** One co-signed channel state (go-nitro `SignedVariablePart`). */
+export interface SignedChannelState {
+  readonly outcome: readonly NitroSingleAssetExit[];
+  /** Application data bytes, 0x-prefixed. */
+  readonly appData: string;
+  readonly turnNum: number;
+  readonly isFinal: boolean;
+  /** One signature per participant, in the `fixedPart.participants` order. */
+  readonly sigs: readonly NitroSignature[];
+}
+
+/** The co-signed states of one channel (H7 evidence). */
+export interface ChannelStatesEntry {
+  readonly channelId: string;
+  readonly fixedPart: NitroFixedPart;
+  readonly states: readonly SignedChannelState[];
+}
 
 /** A complete, forwardable disclosure package. */
 export interface DisclosurePackage {
@@ -178,4 +226,6 @@ export interface DisclosurePackage {
   readonly openings: readonly NoteOpening[];
   readonly proofs: readonly DisclosureProofEntry[];
   readonly hops: readonly Hop[];
+  /** Co-signed channel states, present only when the statement claims an attribution (D20.5). */
+  readonly channelStates?: readonly ChannelStatesEntry[];
 }
