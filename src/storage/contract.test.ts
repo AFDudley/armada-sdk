@@ -7,7 +7,7 @@ import { MemoryLevel } from 'memory-level';
 import { MemoryStorageAdapter } from './memory';
 import { IndexedDBStorageAdapter } from './indexeddb';
 import { LevelStorageAdapter, type AbstractLevelLike } from './level';
-import { StorageConflictError } from '../errors';
+import { InstanceClosedError, StorageConflictError } from '../errors';
 import type { StorageAdapter, StorageNamespace } from './index';
 
 const ns = (deployBlock = 1): StorageNamespace => ({ schemaVersion: 1, chainId: 31337, poolAddress: `0x${'11'.repeat(20)}`, deployBlock });
@@ -103,6 +103,25 @@ describe.each(ADAPTERS)('%s adapter — StorageAdapter contract (#138)', (_name,
     await expect(store.open(ns(999))).rejects.toBeInstanceOf(StorageConflictError);
     expect(dec(await store.get('chain/x'))).toBe('kept');
     await expect(store.open(ns())).resolves.toEqual({ reset: false }); // the same namespace is a harmless no-op
+    await store.close();
+  });
+
+  it('a closed adapter rejects every call with INSTANCE_CLOSED until it is opened again (#140)', async () => {
+    // WHY: a closed IndexedDB adapter quietly reopened its database on the next call, without the Web Lock, so a
+    // late write from a torn-down SDK could land beside a new instance's.
+    const store = await opened();
+    await store.put('chain/x', enc('kept'));
+    await store.close();
+    await expect(store.get('chain/x')).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.put('chain/y', enc('y'))).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.del('chain/x')).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.update('chain/x', () => undefined)).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.batch([{ type: 'del', key: 'chain/x' }])).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(keysOf(store, 'chain/')).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.resetChainState()).rejects.toBeInstanceOf(InstanceClosedError);
+    await expect(store.close()).resolves.toBeUndefined(); // closing twice is harmless
+    await store.open(ns());
+    expect(dec(await store.get('chain/x'))).toBe('kept');
     await store.close();
   });
 });

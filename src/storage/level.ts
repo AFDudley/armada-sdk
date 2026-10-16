@@ -3,7 +3,7 @@
 
 import { StorageConflictError } from '../errors';
 import type { StorageAdapter, StorageNamespace, StorageOp, StorageWriteOptions } from './index';
-import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding } from './namespace';
+import { NAMESPACE_KEY, isPreserved, encodeNamespace, bytesEqual, assertSameBinding, assertNotClosed } from './namespace';
 
 /**
  * The minimal `abstract-level` surface `LevelStorageAdapter` needs. `classic-level` (Node LevelDB),
@@ -50,10 +50,21 @@ export class LevelStorageAdapter implements StorageAdapter {
   private bound: Uint8Array | undefined;
   // The tail of the write queue: each write starts once the previous one has settled.
   private writes: Promise<unknown> = Promise.resolve();
+  // Set by close(), cleared by open(): a closed adapter rejects every other call.
+  private closed = false;
 
   constructor(private readonly db: AbstractLevelLike) {}
 
+  private assertOpen(): void {
+    assertNotClosed('LevelStorageAdapter', this.closed);
+  }
+
   private serialized<T>(write: () => Promise<T>): Promise<T> {
+    try {
+      this.assertOpen();
+    } catch (err) {
+      return Promise.reject(err);
+    }
     const run = this.writes.then(write, write);
     this.writes = run.catch(() => undefined);
     return run;
@@ -62,6 +73,7 @@ export class LevelStorageAdapter implements StorageAdapter {
   async open(namespace: StorageNamespace): Promise<{ reset: boolean }> {
     const nsBytes = encodeNamespace(namespace);
     if (assertSameBinding('LevelStorageAdapter', this.bound, nsBytes)) return { reset: false };
+    this.closed = false;
     if (this.db.status !== 'open') {
       try {
         await this.db.open();
@@ -84,6 +96,7 @@ export class LevelStorageAdapter implements StorageAdapter {
   }
 
   async get(key: string): Promise<Uint8Array | undefined> {
+    this.assertOpen();
     const v = await this.db.get(key, ENC);
     return v === undefined ? undefined : new Uint8Array(v);
   }
@@ -121,6 +134,7 @@ export class LevelStorageAdapter implements StorageAdapter {
   }
 
   async *list(prefix: string): AsyncIterable<{ key: string; value: Uint8Array }> {
+    this.assertOpen();
     // Half-open range [prefix, prefix+￿]; keys are ASCII paths (chain/ identity/ durable/), so the
     // sentinel can't clip a real key (same convention as the IndexedDB adapter).
     const entries = await this.db.iterator({ gte: prefix, lte: `${prefix}￿`, ...ENC }).all();
@@ -139,5 +153,6 @@ export class LevelStorageAdapter implements StorageAdapter {
   async close(): Promise<void> {
     if (this.db.status === 'open') await this.db.close();
     this.bound = undefined;
+    this.closed = true;
   }
 }

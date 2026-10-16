@@ -304,10 +304,18 @@ const sdk = await createArmadaSdk({
   artifacts: ArtifactSource,        // §4.5
   telemetry?: TelemetrySink,        // §8
 });
-await sdk.close();                  // releases storage, terminates workers
+await sdk.close();                  // cancels in-flight syncs, disposes wallets, releases provider, prover, storage
 ```
 
 - No singletons, no module-level mutable state (the `snarkjsInitialized` bug class).
+- **Shutdown order.** `close()` stops every watcher, destroys the provider and closes the prover (so a
+  running sync's next RPC call and a running proof fail), then disposes every wallet — each aborts its
+  in-flight proofs (the signal reaches the signer), waits for its sync and proofs to settle, disposes
+  the signer the SDK made for it, and wipes its viewing key — and closes storage last, so a late sync
+  never writes to a closed store. A sync or proof cut short by `close()` or `wallet.dispose()` rejects
+  with `InstanceClosedError`; the sync saves nothing.
+  Every call after `close()` (the factory, any wallet call, `watch()`) or after `wallet.dispose()`
+  throws `InstanceClosedError`; a second `close()`/`dispose()` is a no-op.
 - All long operations accept `AbortSignal`.
 - Typed error taxonomy (§8) — no string-matching on error messages anywhere in consuming code.
 
@@ -390,7 +398,8 @@ interface SpendIntentContext {
 
 interface SpendSigner {
   getSpendingPublicKey(): Promise<[bigint, bigint]>;
-  signBatch(requests: SpendSignRequest[]): Promise<EddsaSignature[]>;
+  signBatch(requests: SpendSignRequest[], options?: { signal?: AbortSignal }): Promise<EddsaSignature[]>;
+  dispose?(): void;
 }
 ```
 
@@ -403,6 +412,17 @@ interface SpendSigner {
   policy-gated; transport and gating are defined by the consuming integration, e.g.
   `specs/PAROS_INTEGRATION.md`, **not** by the SDK), and later `ThresholdSigner` (FROST on Baby
   Jubjub — a pure signer swap; circuits/contracts/tx semantics see a standard EdDSA signature).
+- **The SDK checks the signer.** A signer attached to a wallet must hold its spending key
+  (`getSpendingPublicKey()` is compared at load), and every returned signature is verified against
+  that key before proving; either failure is a `SignerContractViolationError`. To keep the spend key
+  out of the SDK entirely, attach the signer to `viewOnlyFromViewingKey`: `fromRootSecret` and
+  `fromMnemonic` derive the key first (and zero it at once when a signer is passed). The default
+  `LocalSigner` holds the only copy of the derived key, so its `dispose()` wipes it. Wiping is
+  best-effort: bigint and string copies (the nullifying key, the engine's hex conversions) can't be
+  wiped.
+- **Cancellation reaches the signer.** `prove`/`proveAll` pass their `AbortSignal` to `signBatch`; if
+  it fires while the signer is working, the SDK discards the signatures and throws `AbortedError`
+  without proving.
 - Signing happens during witness assembly: `wallet.prove(plan)` / `wallet.proveAll(plans)` request
   signatures from the wallet's attached `SpendSigner` before proof generation. External-signer latency
   therefore gates proving; the `ProofHandle` TTL model (§4.6) is the vehicle for
@@ -422,6 +442,8 @@ A wallet is **viewing capability ± spend capability**; a view-only wallet is a 
 
 ```ts
 viewWallet = await sdk.wallet.viewOnlyFromViewingKey(shareableViewingKey, { creationBlock });
+// Spend-capable with no spend key in the SDK: attach a signer that holds it (§4.2.1).
+spendWallet = await sdk.wallet.viewOnlyFromViewingKey(shareableViewingKey, { creationBlock, signer });
 ```
 
 - Full scan/balance/history/`note:received`/disclosure-export capability; any spend-path call
@@ -473,6 +495,8 @@ Requirements:
   Node: per-instance path from config with advisory locking. Either way, a conflict is a clear
   typed error (`StorageConflictError`), and an open adapter refuses to rebind to another
   deployment.
+- **Closed means closed.** After `close()`, an adapter rejects every call except `open()` with
+  `InstanceClosedError` (rather than, say, IndexedDB reopening its database without the lock).
 - Ephemeral wallets (§6) never touch the StorageAdapter.
 
 ### 4.4 Sync

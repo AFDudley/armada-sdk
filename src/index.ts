@@ -145,6 +145,11 @@ export interface ArmadaSdkConfig {
  */
 export interface ArmadaSdk {
   readonly wallet: WalletFactory;
+  /**
+   * Shut the instance down (SPEC §4.1): stop every watcher, cancel in-flight work (a running sync or proof rejects
+   * with `InstanceClosedError`; the sync saves nothing), dispose every wallet, and release the provider, prover and storage.
+   * Every call on the instance or its wallets afterwards throws `InstanceClosedError`; calling it again does nothing.
+   */
   close(): Promise<void>;
 }
 

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { initPoseidonPromise, verifyEDDSA } from '../core/index';
 import { LocalSigner } from './local-signer';
+import { deriveKeyset } from './derive';
 import { ExternalSigner } from './external-signer';
 import { deriveViewOnlyIdentity } from './view-only';
 import type { SpendSignRequest } from './index';
@@ -80,6 +81,18 @@ describe('ExternalSigner (custody boundary is swappable)', () => {
     );
     await expect(bad.signBatch([req(1n), req(2n)])).rejects.toBeInstanceOf(SignerContractViolationError);
   });
+
+  it('forwards the abort signal to its backend (#140)', async () => {
+    // WHY: a backend waiting on human approval had no way to learn the proof was cancelled.
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const external = new ExternalSigner(
+      async (requests, options) => { seen = options?.signal; return requests.map(() => ({ R8: [1n, 2n], S: 3n })); },
+      async () => [1n, 2n],
+    );
+    await external.signBatch([req(1n)], { signal: controller.signal });
+    expect(seen).toBe(controller.signal);
+  });
 });
 
 describe('view-only identity (SPEC §4.2.2)', () => {
@@ -90,5 +103,22 @@ describe('view-only identity (SPEC §4.2.2)', () => {
     expect(bigToHex(identity.nullifyingKey)).toBe(V.keyset.nullifyingKey);
     expect(bigToHex(identity.masterPublicKey)).toBe(V.keyset.masterPublicKey);
     expect(identity.shieldedAddress).toBe(V.keyset.shieldedAddress);
+  });
+});
+
+describe('LocalSigner key custody (#140)', () => {
+  beforeAll(async () => {
+    await initPoseidonPromise;
+  });
+
+  it('fromKeyset takes the keyset\'s spend key as its only copy, so dispose() zeroes it', async () => {
+    // WHY: the wallet kept the keyset's spend key and LocalSigner derived a second copy; dispose() zeroed only its own,
+    // leaving the wallet's copy in memory. Taking the derived buffer means there's one copy, and dispose() wipes it.
+    const keyset = await deriveKeyset(new Uint8Array(32).fill(0x11));
+    const signer = LocalSigner.fromKeyset(keyset);
+    expect(await signer.getSpendingPublicKey()).toEqual(keyset.spendingPublicKey);
+    expect(keyset.spendingPrivateKey.some((b) => b !== 0)).toBe(true);
+    signer.dispose();
+    expect(keyset.spendingPrivateKey.every((b) => b === 0)).toBe(true);
   });
 });

@@ -87,11 +87,16 @@ code, so a wrong RPC fails loudly instead of syncing an empty wallet. With sever
 fails over between them.
 
 Instances are self-contained — there is no global state, and you can run more than one in a single
-process. When you are done, `close()` releases the prover's workers:
+process. When you are done, `close()` shuts the instance down:
 
 ```ts
 await sdk.close();
 ```
+
+It stops every watcher and cancels in-flight work: a running sync or proof rejects with
+`InstanceClosedError`, and the sync saves nothing. It then disposes every wallet (see [Disposing a wallet](./wallets#disposing-a-wallet)),
+and releases the RPC provider, the prover's workers and the storage adapter. Every call on the instance
+or its wallets afterwards throws `InstanceClosedError`; calling `close()` again does nothing.
 
 ## Load a wallet
 

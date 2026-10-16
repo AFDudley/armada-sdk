@@ -132,6 +132,15 @@ export class AbortedError extends ArmadaError {
 }
 
 /**
+ * The SDK instance was closed, the wallet was disposed, or the storage adapter was closed (SPEC §4.1). Every call
+ * after `sdk.close()` or `wallet.dispose()` throws it, and so does a sync cancelled by one; a closed adapter throws
+ * it until it's opened again.
+ */
+export class InstanceClosedError extends ArmadaError {
+  readonly code = 'INSTANCE_CLOSED';
+}
+
+/**
  * The prover worker stopped before replying (SPEC §4.5): it crashed or failed to load, it was terminated
  * to cancel another in-flight request, or the prover was closed. Unless the prover was closed, the next
  * request starts a fresh worker, so the operation can be retried.

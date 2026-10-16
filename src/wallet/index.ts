@@ -18,6 +18,15 @@ export interface SpendSignRequest {
   readonly context: SpendIntentContext;
 }
 
+/** Per-call options for `SpendSigner.signBatch`. */
+export interface SpendSignOptions {
+  /**
+   * Fires when the SDK no longer wants the signatures (the proof was cancelled). A signer that waits on a human or a
+   * remote service should stop waiting and reject. The SDK discards any signatures returned after it fires.
+   */
+  readonly signal?: AbortSignal;
+}
+
 /**
  * Custody boundary (SPEC §4.2.1). Batch semantics are part of the contract: the signer receives the
  * ENTIRE batch of fully-bound intents before releasing ANY signature — "approve one signature =
@@ -26,7 +35,7 @@ export interface SpendSignRequest {
  */
 export interface SpendSigner {
   getSpendingPublicKey(): Promise<[bigint, bigint]>;
-  signBatch(requests: readonly SpendSignRequest[]): Promise<EddsaSignature[]>;
+  signBatch(requests: readonly SpendSignRequest[], options?: SpendSignOptions): Promise<EddsaSignature[]>;
   /** Optional: release/zeroize held key material (SPEC §4.2). A disposed signer refuses to sign. */
   dispose?(): void;
 }
@@ -173,6 +182,14 @@ export interface Wallet {
    * you've just synced explicitly). Works view-only. Throws `InvalidRequestError` if already watching.
    */
   watch(options?: { intervalMs?: number; immediate?: boolean; onError?: (err: Error) => void }): Unsubscribe;
+  /**
+   * Release the wallet (SPEC §4.1): stop its watcher, cancel an in-flight sync or proof and wait for it to settle (it
+   * rejects with `InstanceClosedError`; a proof's signal fires, so a signer waiting on approval can stop), dispose the
+   * signer the SDK made for it (one you passed in is yours to dispose), and wipe its viewing key. Every call afterwards throws `InstanceClosedError`; calling it again does
+   * nothing. `sdk.close()` disposes every wallet still open, so call this for a wallet you're done with before then
+   * (e.g. an ephemeral claim wallet). Key wiping is best-effort: JavaScript can't wipe bigint or string copies.
+   */
+  dispose(): Promise<void>;
 }
 
 export interface PlanTransferRequest {
@@ -232,7 +249,11 @@ export interface WalletFactory {
    * Load a wallet from its rootSecret. Spend-capable by DEFAULT (SPEC §4.2.1: `LocalSigner` is the
    * default) — the SDK derives a `LocalSigner` internally, since the rootSecret already grants spend
    * power. Pass `signer` to attach a different signer (e.g. `ExternalSigner`), or `viewOnly: true` for
-   * a view-only wallet from a rootSecret (no spend key held; spend-path calls throw NoSpendCapabilityError).
+   * a view-only wallet from a rootSecret (the derived spend key is zeroed at once; spend-path calls throw
+   * NoSpendCapabilityError). A `signer` must hold this wallet's spending key: one whose
+   * `getSpendingPublicKey()` differs is rejected with `SignerContractViolationError` before the wallet loads.
+   * Deriving from the root secret puts the spend key in the SDK briefly even with an external signer; to keep
+   * it out entirely, use `viewOnlyFromViewingKey` with a signer.
    *
    * `creationBlock` is where the wallet starts looking for its notes; the merkle tree is always built from
    * the pool's deploy block, so a later value never breaks syncing. Pass the deploy block when the same
@@ -253,8 +274,13 @@ export interface WalletFactory {
     mnemonic: string,
     opts: { creationBlock: number; signer?: SpendSigner; viewOnly?: boolean; derivationIndex?: number },
   ): Promise<Wallet>;
-  /** View-only: full scan/balance/disclosure, no spend (spend-path calls throw NoSpendCapabilityError). */
-  viewOnlyFromViewingKey(shareableViewingKey: string, opts: { creationBlock: number }): Promise<Wallet>;
+  /**
+   * From a shareable viewing key: full scan/balance/history. View-only by default (spend-path calls throw
+   * NoSpendCapabilityError). Pass `signer` (e.g. an `ExternalSigner` over an HSM or policy service) to make it
+   * spend-capable while the spend key never enters the SDK — the only way to spend without the SDK seeing the
+   * root secret.
+   */
+  viewOnlyFromViewingKey(shareableViewingKey: string, opts: { creationBlock: number; signer?: SpendSigner }): Promise<Wallet>;
 }
 
 // Implementations.

@@ -10,9 +10,10 @@ import {
   getTokenDataHash,
   decodeAddress,
   OutputType,
+  verifyEDDSA,
 } from '../core/index';
 import { createTransferNote, encryptNoteToReceiver, type CommitmentCiphertextV2 } from '../sync/index';
-import { SignerContractViolationError } from '../errors';
+import { AbortedError, SignerContractViolationError } from '../errors';
 import type { SpendSigner, SpendSignRequest, EddsaSignature } from '../wallet/index';
 import type { PlanSummary, DecodedBoundParams, CctpBinding } from './index';
 import type { CircuitShape } from '../prover/index';
@@ -182,13 +183,38 @@ function fullNetworkID(chainType: number, chainId: number): bigint {
  * caller-controlled and MUST be fee-first. Correctness of the circuit-field format is validated by the
  * tx chain differential; this builds the invariants (nullifiers, commitments, signature, hash) exactly.
  */
-export async function buildWitness(params: BuildWitnessParams): Promise<BuiltWitness> {
+export async function buildWitness(params: BuildWitnessParams, signal?: AbortSignal): Promise<BuiltWitness> {
   const prepared = await prepareWitness(params);
-  const [signature] = await params.signer.signBatch([prepared.signRequest]);
+  const [signature] = await signWithin(params.signer, [prepared.signRequest], signal);
   if (signature === undefined) {
     throw new SignerContractViolationError('buildWitness: signer returned no signature');
   }
   return prepared.finalize(signature);
+}
+
+/**
+ * Ask the signer for a batch, passing it `signal`. If the signal fired while the signer was working, the signatures are
+ * discarded and this throws `AbortedError`: a cancelled proof never goes on to prove with them.
+ */
+export async function signWithin(
+  signer: SpendSigner,
+  requests: readonly SpendSignRequest[],
+  signal: AbortSignal | undefined,
+): Promise<EddsaSignature[]> {
+  if (signal?.aborted) throw new AbortedError('sign: aborted before start');
+  const signatures = await signer.signBatch(requests, signal !== undefined ? { signal } : undefined);
+  if (signal?.aborted) throw new AbortedError('sign: aborted while the signer was signing');
+  return signatures;
+}
+
+// Whether `signature` is a valid EdDSA (Poseidon) signature of `message` under `publicKey`. A malformed signature (e.g. a
+// point off the curve) makes the verifier throw; that's a bad signature too.
+function signatureVerifies(message: bigint, signature: EddsaSignature, publicKey: readonly [bigint, bigint]): boolean {
+  try {
+    return verifyEDDSA(message, { R8: [signature.R8[0], signature.R8[1]], S: signature.S }, [publicKey[0], publicKey[1]]);
+  } catch {
+    return false;
+  }
 }
 
 /** A witness assembled up to the spend-auth signature: the intent to sign, and how to finish once signed. */
@@ -280,6 +306,13 @@ export async function prepareWitness(params: Omit<BuildWitnessParams, 'signer'>)
   };
 
   const finalize = (signature: EddsaSignature): BuiltWitness => {
+    // Check the signature before it goes anywhere near the prover: a bad one would only surface as an opaque circuit
+    // failure after ~30s of proving (#140).
+    if (!signatureVerifies(message, signature, params.sender.spendingPublicKey)) {
+      throw new SignerContractViolationError(
+        "the SpendSigner returned a signature that doesn't verify against the wallet's spending public key",
+      );
+    }
     const formattedInputs: FormattedCircuitInputs = {
       merkleRoot: params.merkleRoot,
       boundParamsHash,

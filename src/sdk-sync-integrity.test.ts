@@ -581,6 +581,45 @@ describe('TX-4: readers see only the last committed sync, never a half-applied o
   });
 });
 
+describe('close() during a sync (#140)', () => {
+  // Records every key written, so a test can see whether a write landed.
+  class RecordingStorage extends MemoryStorageAdapter {
+    readonly written: string[] = [];
+    override async put(key: string, value: Uint8Array): Promise<void> {
+      this.written.push(key);
+      return super.put(key, value);
+    }
+  }
+
+  it('waits for the in-flight sync, which rejects with INSTANCE_CLOSED and saves nothing', async () => {
+    // WHY: close() destroyed the provider and closed storage under a running sync, which then failed with an opaque
+    // provider error or wrote its checkpoint to a closed store.
+    await pushShield(10, keyset, 1_000_000n);
+    chain.head = 10;
+    const storage = new RecordingStorage();
+    const sdk = await createArmadaSdk(cfg({ storage }));
+    const wallet = await sdk.wallet.fromRootSecret(ROOT_SECRET, { creationBlock: 1 });
+    let release!: () => void;
+    chain.callGate = new Promise((r) => (release = r));
+    const entered = new Promise<void>((r) => (chain.callEntered = r));
+    const outcome = wallet.sync().catch((err: unknown) => err);
+    await entered; // the sync is verifying its batch
+
+    let closed = false;
+    const closing = sdk.close().then(() => {
+      closed = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(closed).toBe(false); // close() waits for the sync
+
+    chain.callGate = undefined;
+    release();
+    await closing;
+    expect(await outcome).toMatchObject({ code: 'INSTANCE_CLOSED' });
+    expect(storage.written.filter((k) => k.endsWith('/scan-state'))).toEqual([]);
+  });
+});
+
 describe('SYNC-13: balance:updated agrees with balances() on spendable vs pending', () => {
   it('uses the same chain head as balances() when confirmationDepth holds the scan back', async () => {
     await pushShield(10, keyset, 1_000_000n);

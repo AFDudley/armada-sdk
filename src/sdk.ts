@@ -92,6 +92,8 @@ import {
   InvalidRequestError,
   InvalidConfigError,
   QuickSyncSchemaError,
+  SignerContractViolationError,
+  InstanceClosedError,
 } from './errors';
 import { validateConfig } from './config';
 import { startAutoSync } from './sync/auto-sync';
@@ -136,6 +138,10 @@ interface SdkContext {
   readonly autoSyncIntervalMs: number;
   /** Active `wallet.watch()` stop functions for this SDK instance — stopped on `close()`. */
   readonly watchers: Set<() => void>;
+  /** Every wallet the instance has handed out and not yet disposed — `close()` disposes them. */
+  readonly wallets: Set<ArmadaWallet>;
+  /** Set once `close()` starts; from then on the factory refuses new wallets. */
+  readonly lifecycle: { closed: boolean };
   /** Circuit shapes the deployment can prove — plan-time fail-fast set, or undefined to skip the check. */
   readonly supportedShapes: ReadonlySet<string> | undefined;
   /** Spendable-note count from which single-proof spends sweep the tree's smallest notes (issue #108; default 5, 0 = off). */
@@ -240,6 +246,52 @@ export function quickSyncTelemetry(input: {
       ...(status !== undefined ? { status } : {}),
     },
   };
+}
+
+// A wallet's keys without the spending PRIVATE key: the wallet only ever needs the public half (for the witness).
+// Signing is the SpendSigner's job, so the private key lives in the signer or nowhere (#140).
+type WalletKeys = Omit<Keyset, 'spendingPrivateKey'>;
+
+function withoutSpendKey(keyset: Keyset): WalletKeys {
+  return {
+    spendingPublicKey: keyset.spendingPublicKey,
+    viewingPublicKey: keyset.viewingPublicKey,
+    viewingPrivateKey: keyset.viewingPrivateKey,
+    nullifyingKey: keyset.nullifyingKey,
+    masterPublicKey: keyset.masterPublicKey,
+    shieldedAddress: keyset.shieldedAddress,
+  };
+}
+
+// The signer a factory attaches to a freshly derived keyset, leaving at most one copy of the spend key: a LocalSigner
+// takes the derived buffer as its own; with an explicit signer, or view-only, the derived key is zeroed at once.
+async function signerFor(keyset: Keyset, opts: { signer?: SpendSigner; viewOnly?: boolean }): Promise<AttachedSigner | undefined> {
+  if (opts.signer !== undefined) {
+    keyset.spendingPrivateKey.fill(0);
+    await assertSignerHoldsKey(opts.signer, keyset.spendingPublicKey);
+    return { signer: opts.signer, owned: false };
+  }
+  if (opts.viewOnly === true) {
+    keyset.spendingPrivateKey.fill(0);
+    return undefined;
+  }
+  return { signer: LocalSigner.fromKeyset(keyset), owned: true };
+}
+
+// A wallet's signer, and whether the SDK made it. `wallet.dispose()` disposes only a signer the SDK made: one the app
+// passed in is the app's to dispose (it may serve other wallets).
+interface AttachedSigner {
+  readonly signer: SpendSigner;
+  readonly owned: boolean;
+}
+
+// A signer must hold the wallet's spending key: one that doesn't would be accepted as `canSpend`, then fail as an
+// opaque circuit error after its signatures were released (#140).
+async function assertSignerHoldsKey(signer: SpendSigner, spendingPublicKey: readonly [bigint, bigint]): Promise<void> {
+  const [x, y] = await signer.getSpendingPublicKey();
+  if (x !== spendingPublicKey[0] || y !== spendingPublicKey[1]) {
+    throw new SignerContractViolationError("the SpendSigner's spending public key isn't this wallet's");
+  }
 }
 
 // The storage layout version, part of the deployment namespace: a store written under another version is reset
@@ -383,11 +435,20 @@ class ArmadaWallet implements Wallet {
   private syncInFlight: Promise<{ fromBlock: number; syncedThrough: number; scanned: boolean }> | undefined;
   // The active auto-sync unsubscribe (issue #59), if this wallet is watching — one loop per wallet.
   private watchStop: Unsubscribe | undefined;
+  // In-flight proofs: dispose() waits for them, so it never wipes keys a witness is still being built from.
+  private readonly proving = new Set<Promise<unknown>>();
+  // Aborted by dispose(): cancels in-flight proofs, telling a signer still waiting on approval to stop, so dispose()
+  // doesn't wait on a person.
+  private readonly lifetime = new AbortController();
+  // Set by dispose() (directly, or via sdk.close()): every call afterwards throws InstanceClosedError.
+  private disposed = false;
+  private readonly signer: SpendSigner | undefined;
+  private readonly ownsSigner: boolean;
 
   constructor(
-    private readonly keyset: Keyset,
+    private readonly keyset: WalletKeys,
     private readonly creationBlock: number,
-    private readonly signer: SpendSigner | undefined,
+    attached: AttachedSigner | undefined,
     private readonly ctx: SdkContext,
     // Ephemeral (claimable-payment) wallets are in-memory only: they never load from or write to
     // the StorageAdapter, so no decrypted note data or seed-derived identity hits disk (SPEC §4.3/§6.5).
@@ -399,6 +460,28 @@ class ArmadaWallet implements Wallet {
     this.syncedThrough = ctx.deployBlock - 1;
     // This wallet's own scope of the shared adapter, encrypted at rest by default (§4.3).
     this.storage = resolveWalletStorage(ctx.storage, keyset.viewingPrivateKey, ctx.allowPlaintextStorage);
+    this.signer = attached?.signer;
+    this.ownsSigner = attached?.owned === true;
+    ctx.wallets.add(this);
+  }
+
+  private assertUsable(): void {
+    if (this.disposed) throw new InstanceClosedError('wallet: used after wallet.dispose() or sdk.close()');
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.watchStop?.();
+    this.lifetime.abort();
+    // Let in-flight work settle first: a sync stops at its next step (it checks `disposed`), and a proof stops on its
+    // aborted signal. Only then are the keys they read wiped.
+    await Promise.allSettled([this.syncInFlight, ...this.proving]);
+    if (this.ownsSigner) this.signer?.dispose?.();
+    // Best-effort: the viewing key buffer is wiped, but bigint keys (the nullifying key) can't be, and the engine may
+    // hold string copies of key material (docs/guide/security.md).
+    this.keyset.viewingPrivateKey.fill(0);
+    this.ctx.wallets.delete(this);
   }
 
   // This wallet's storage handle: its own scope of the shared adapter (under its opaque record id, never the 0zk
@@ -586,16 +669,19 @@ class ArmadaWallet implements Wallet {
   private async recoverByRescan(
     reason: ReorgRecoveryReason,
   ): Promise<{ fromBlock: number; syncedThrough: number; scanned: boolean }> {
+    this.assertUsable();
     this.ctx.telemetry?.emit('sync.reorg-recovery', { fromBlock: this.ctx.deployBlock, reason });
     await this.resetChainDerivedState();
     return this.runSync(true);
   }
 
   on<K extends keyof SyncEventMap>(event: K, listener: (payload: SyncEventMap[K]) => void): Unsubscribe {
+    this.assertUsable();
     return this.emitter.on(event, listener);
   }
 
   watch(options?: { intervalMs?: number; immediate?: boolean; onError?: (err: Error) => void }): Unsubscribe {
+    this.assertUsable();
     if (this.watchStop !== undefined) {
       throw new InvalidRequestError('watch: this wallet is already watching (stop the existing watcher first)');
     }
@@ -618,12 +704,14 @@ class ArmadaWallet implements Wallet {
   }
 
   async syncStatus(): Promise<{ syncedThrough: number; syncing: boolean }> {
+    this.assertUsable();
     // Cheap status (SPEC §4.4): the checkpoint (loaded from storage when the wallet was created) + whether
     // a sync is in flight. No getLogs, no state change.
     return { syncedThrough: this.syncedThrough, syncing: this.syncInFlight !== undefined };
   }
 
   async sync(): Promise<{ fromBlock: number; syncedThrough: number; scanned: boolean }> {
+    this.assertUsable();
     // Coalesce concurrent syncs (UI poll + manual refresh) onto one run: two runs both building on the
     // same committed tree would double-apply a range and throw a merkle position gap.
     if (this.syncInFlight !== undefined) return this.syncInFlight;
@@ -713,6 +801,8 @@ class ArmadaWallet implements Wallet {
       const qs = quickSyncTelemetry({ usingIndexer, tailCovered, fellBack, fromBlock: from, head, cause: fallbackCause });
       if (qs !== null) this.ctx.telemetry?.emit(qs.event, qs.data);
 
+      // A wallet disposed mid-sync (or a closing SDK) keeps nothing from it: stop before saving or committing.
+      this.assertUsable();
       // Ephemeral wallets keep their scan state in memory only — never write note data to disk (SPEC §6.5).
       if (!this.ephemeral) {
         await saveScanState(this.storage, next, head, headHash);
@@ -729,6 +819,11 @@ class ArmadaWallet implements Wallet {
       this.emitReceivedNotes();
       return { fromBlock, syncedThrough: head, scanned: true };
     } catch (err) {
+      // Cancelled by dispose()/close() (its RPC calls may fail first, on the destroyed provider): no recovery, no
+      // scan:error — the caller learns the wallet is closed.
+      if (this.disposed) {
+        throw err instanceof InstanceClosedError ? err : new InstanceClosedError('sync: cancelled by wallet.dispose() or sdk.close()', { cause: err });
+      }
       // Two failures no retry can fix, so self-heal by rescanning from the deploy block (`recovering`
       // guards a loop): (1) the local tree is missing leaves — a leaf arrived past its next position, so part
       // of the chain was skipped; (2) a reorg removed an already-PERSISTED leaf the hash check couldn't see
@@ -826,6 +921,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async balances(): Promise<TokenBalance[]> {
+    this.assertUsable();
     this.prunePendingSpends();
     const head = await this.ctx.provider.getBlockNumber();
     const raw = this.scanState.balances(this.keyset.nullifyingKey, { currentBlock: head, finalityThreshold: this.ctx.finalityThreshold }, this.holds.list());
@@ -833,12 +929,14 @@ class ArmadaWallet implements Wallet {
   }
 
   spendableNullifiers(): readonly { readonly tree: number; readonly nullifier: bigint }[] {
+    this.assertUsable();
     return this.scanState
       .spendableTxos(this.keyset.nullifyingKey, this.holds.list())
       .map((txo) => ({ tree: txo.tree, nullifier: TransactNote.getNullifier(this.keyset.nullifyingKey, txo.position) }));
   }
 
   async preflight(plan: Plan | readonly Plan[], options?: { quoteDeadline?: number }): Promise<PreflightResult> {
+    this.assertUsable();
     // Cheap pre-proof checks (SPEC §4.7): the proved root must still be accepted by the pool, no input
     // note may already be spent on-chain, and (if a deadline is given) the fee quote must still be usable —
     // turning the 30-second-proof-then-revert failure into a typed finding. Nullifiers are derived from
@@ -864,6 +962,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async history(options?: { sinceBlock?: number }): Promise<HistoryEntry[]> {
+    this.assertUsable();
     let entries = reconstructHistory({
       ownedTxos: this.scanState.ownedTxos(),
       spentNullifiers: this.scanState.spentNullifiers(),
@@ -900,6 +999,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async planTransfer(request: PlanTransferRequest): Promise<Plan[]> {
+    this.assertUsable();
     if (!this.canSpend) throw new NoSpendCapabilityError('planTransfer: wallet has no SpendSigner');
     this.prunePendingSpends();
     const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
@@ -909,6 +1009,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async planTransferAfter(consolidation: readonly Plan[], request: PlanTransferRequest): Promise<PlanSelection[]> {
+    this.assertUsable();
     this.prunePendingSpends();
     // Plan over the notes as they'd be once the consolidation confirms (its merged notes in the current
     // tree). Planning only — the hypothetical notes can't be proved, so no merkle proofs are captured.
@@ -924,6 +1025,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async maxTransferAmount(request: MaxTransferRequest): Promise<bigint> {
+    this.assertUsable();
     this.prunePendingSpends();
     const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
     // The planner request for a transfer (`transfer` fee tier); the max probes it with its own amounts.
@@ -931,6 +1033,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async maxUnshieldAmount(request: MaxUnshieldRequest): Promise<bigint> {
+    this.assertUsable();
     this.prunePendingSpends();
     const txos = this.scanState.spendableTxos(this.keyset.nullifyingKey, this.holds.list());
     // The planner request for this unshield (at the caller's per-proof fee); the max probes its value.
@@ -949,6 +1052,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async consolidate(request: ConsolidateRequest): Promise<Plan[]> {
+    this.assertUsable();
     if (!this.canSpend) throw new NoSpendCapabilityError('consolidate: wallet has no SpendSigner');
     const supportedShapes = this.ctx.supportedShapes;
     if (supportedShapes === undefined) {
@@ -1090,14 +1194,40 @@ class ArmadaWallet implements Wallet {
   }
 
   async prove(plan: Plan, options?: ProveOptions): Promise<ProofHandle> {
+    this.assertUsable();
     if (!this.signer) throw new NoSpendCapabilityError('prove: wallet has no SpendSigner');
-    return prove(this.proveParams(plan, this.signer, options), options);
+    const signer = this.signer;
+    return this.trackProof(options, async (opts) => prove(this.proveParams(plan, signer, opts), opts));
   }
 
   async proveAll(plans: readonly Plan[], options?: ProveOptions): Promise<ProofHandle[]> {
+    this.assertUsable();
     if (!this.signer) throw new NoSpendCapabilityError('proveAll: wallet has no SpendSigner');
     const signer = this.signer;
-    return proveAll(plans.map((plan) => this.proveParams(plan, signer, options)), options);
+    return this.trackProof(options, async (opts) => proveAll(plans.map((plan) => this.proveParams(plan, signer, opts)), opts));
+  }
+
+  // Run a proof that dispose() can cancel and waits for: its signal fires on the caller's signal or on dispose().
+  private async trackProof<T>(options: ProveOptions | undefined, run: (options: ProveOptions) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    const signals = options?.signal !== undefined ? [this.lifetime.signal, options.signal] : [this.lifetime.signal];
+    for (const signal of signals) {
+      if (signal.aborted) abort();
+      else signal.addEventListener('abort', abort, { once: true });
+    }
+    const proof = run({ ...options, signal: controller.signal });
+    this.proving.add(proof);
+    try {
+      return await proof;
+    } catch (err) {
+      if (this.disposed) throw new InstanceClosedError('prove: cancelled by wallet.dispose() or sdk.close()', { cause: err });
+      throw err;
+    } finally {
+      this.proving.delete(proof);
+      // A long-lived wallet proves many times: don't leave a listener on its lifetime signal per proof.
+      for (const signal of signals) signal.removeEventListener('abort', abort);
+    }
   }
 
   // The prove() inputs for one plan: its captured witness inputs, fee-first outputs, and the bound params.
@@ -1171,6 +1301,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async markSpendPending(plan: Plan | readonly Plan[], txid: string): Promise<void> {
+    this.assertUsable();
     if (!this.canSpend) throw new NoSpendCapabilityError('markSpendPending: wallet has no SpendSigner');
     this.holds.mark(this.planNullifiers(planList(plan)), txid, Date.now(), this.scanState.spentNullifiers());
     await this.saveHolds();
@@ -1187,6 +1318,7 @@ class ArmadaWallet implements Wallet {
   }
 
   async clearSpendPending(txid: string): Promise<void> {
+    this.assertUsable();
     if (this.holds.clear(txid)) await this.saveHolds();
   }
 
@@ -1209,6 +1341,7 @@ class ArmadaWallet implements Wallet {
   }
 
   shareViewingKey(): string {
+    this.assertUsable();
     return encodeShareableViewingKey({
       viewingPrivateKey: this.keyset.viewingPrivateKey,
       spendingPublicKey: this.keyset.spendingPublicKey,
@@ -1236,8 +1369,8 @@ export function safeTelemetry(sink: TelemetrySink | undefined): TelemetrySink | 
 
 /**
  * Construct an SDK instance — replaces `startRailgunEngine` + `loadProvider` + NETWORK_CONFIG patching.
- * Multiple instances per process are supported; all state is instance-scoped. `close()` releases the
- * prover's workers.
+ * Multiple instances per process are supported; all state is instance-scoped. `close()` cancels in-flight
+ * syncs, disposes every wallet, and releases the provider, the prover's workers and storage.
  *
  * Scan state persists through `config.storage` (namespaced by pool/deployBlock): a wallet's `sync()`
  * resumes from the last synced block rather than rescanning from genesis.
@@ -1377,6 +1510,8 @@ export async function createArmadaSdk(config: ArmadaSdkConfig): Promise<ArmadaSd
     pendingSpendTtlMs: config.pool.pendingSpendTtlMs ?? 300_000,
     autoSyncIntervalMs: config.pool.autoSyncIntervalMs ?? 10_000,
     watchers: new Set<() => void>(),
+    wallets: new Set<ArmadaWallet>(),
+    lifecycle: { closed: false },
     supportedShapes: config.pool.supportedShapes !== undefined ? new Set(config.pool.supportedShapes) : undefined,
     sweepNoteThreshold: config.pool.sweepNoteThreshold ?? 5,
     usdcHash,
@@ -1392,69 +1527,91 @@ export async function createArmadaSdk(config: ArmadaSdkConfig): Promise<ArmadaSd
     ...(telemetry !== undefined ? { telemetry } : {}),
   };
 
-  // Every wallet is returned with its saved state already loaded (scan checkpoint + spend holds).
+  const assertOpen = (): void => {
+    if (ctx.lifecycle.closed) throw new InstanceClosedError('sdk: used after close()');
+  };
+
+  // Every wallet is returned with its saved state already loaded (scan checkpoint + spend holds). One whose load
+  // raced close() is disposed rather than handed out.
   const loaded = async (w: ArmadaWallet): Promise<ArmadaWallet> => {
     await w.load();
+    if (ctx.lifecycle.closed) {
+      await w.dispose();
+      assertOpen();
+    }
     return w;
   };
 
   const wallet: WalletFactory = {
     async fromRootSecret(rootSecret, opts) {
+      assertOpen();
       const keyset = await deriveKeyset(rootSecret);
       // Spend-capable by default: an explicit `signer` wins; else `viewOnly` opts out of spend entirely;
-      // else auto-derive a LocalSigner (the rootSecret already grants spend power, so withholding it
+      // else a LocalSigner over the derived key (the rootSecret already grants spend power, so withholding it
       // buys no security — the least-privilege path is a view-only wallet from a viewing key).
-      const signer = opts.signer ?? (opts.viewOnly === true ? undefined : await LocalSigner.fromRootSecret(rootSecret));
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, signer, ctx));
+      const signer = await signerFor(keyset, opts);
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), opts.creationBlock, signer, ctx));
     },
     async fromMnemonic(mnemonic, opts) {
+      assertOpen();
       const index = opts.derivationIndex ?? 0;
       // deriveKeysetFromMnemonic validates the BIP-39 checksum. Spend-capable by default (like
-      // fromRootSecret): explicit signer wins, `viewOnly` opts out, else auto-derive a LocalSigner.
+      // fromRootSecret): explicit signer wins, `viewOnly` opts out, else a LocalSigner over the derived key.
       const keyset = await deriveKeysetFromMnemonic(mnemonic, index);
-      const signer = opts.signer ?? (opts.viewOnly === true ? undefined : await LocalSigner.fromMnemonic(mnemonic, index));
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, signer, ctx));
+      const signer = await signerFor(keyset, opts);
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), opts.creationBlock, signer, ctx));
     },
     // Ephemeral (claimable payments, SPEC §6): in-memory, never persisted, auto-attaches a signer so
     // the claiming flow can spend. `seed` is the claim's 32-byte root; scans from the pool's deploy
     // block (block 0 would force a multi-million-block getLogs that public RPCs reject).
     async ephemeralFromSeed(seed) {
+      assertOpen();
       const keyset = await deriveKeyset(seed);
-      const signer = await LocalSigner.fromRootSecret(seed);
-      return loaded(new ArmadaWallet(keyset, config.pool.deployBlock, signer, ctx, true));
+      const signer: AttachedSigner = { signer: LocalSigner.fromKeyset(keyset), owned: true };
+      return loaded(new ArmadaWallet(withoutSpendKey(keyset), config.pool.deployBlock, signer, ctx, true));
     },
     async viewOnlyFromViewingKey(shareableViewingKey, opts) {
+      assertOpen();
       const { viewingPrivateKey, spendingPublicKey } = decodeShareableViewingKey(shareableViewingKey);
       const identity = await deriveViewOnlyIdentity(viewingPrivateKey, spendingPublicKey);
-      // View-only: no spending PRIVATE key, no signer → spend-path calls throw NoSpendCapabilityError.
-      const keyset: Keyset = {
+      // No spending private key here at all. Spend-capable only with a `signer` (e.g. over an HSM), which must hold
+      // this wallet's spending key; without one, spend-path calls throw NoSpendCapabilityError.
+      const keys: WalletKeys = {
         spendingPublicKey,
-        spendingPrivateKey: new Uint8Array(0),
         viewingPublicKey: identity.viewingPublicKey,
         viewingPrivateKey,
         nullifyingKey: identity.nullifyingKey,
         masterPublicKey: identity.masterPublicKey,
         shieldedAddress: identity.shieldedAddress,
       };
-      return loaded(new ArmadaWallet(keyset, opts.creationBlock, undefined, ctx));
+      if (opts.signer !== undefined) await assertSignerHoldsKey(opts.signer, spendingPublicKey);
+      const signer: AttachedSigner | undefined = opts.signer !== undefined ? { signer: opts.signer, owned: false } : undefined;
+      return loaded(new ArmadaWallet(keys, opts.creationBlock, signer, ctx));
     },
   };
 
   return {
     wallet,
     async close() {
+      if (ctx.lifecycle.closed) return;
+      ctx.lifecycle.closed = true;
       // Stop any active wallet.watch() loops first (issue #59) so a watcher can't fire sync() against a
       // torn-down provider. Copy to an array: each stop() mutates the set it's iterating.
       for (const stop of [...ctx.watchers]) stop();
       // Release every resource even if an earlier close throws: the ethers provider holds polling
       // timers/sockets that keep a Node process alive (a leak in the relayer/tests) if never destroyed.
       try {
-        await config.prover.close();
+        // Cancel in-flight work first: a destroyed provider fails a running sync's next RPC call, and a closed
+        // prover fails a running proof, so the wallets below settle promptly.
+        provider.destroy();
       } finally {
         try {
-          await config.storage.close();
+          await config.prover.close();
         } finally {
-          provider.destroy();
+          // Each wallet waits for its in-flight sync and proofs to settle, then wipes its keys. Storage closes last,
+          // so a sync settling late never writes to a closed store.
+          await Promise.allSettled([...ctx.wallets].map((w) => w.dispose()));
+          await config.storage.close();
         }
       }
     },

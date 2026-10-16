@@ -280,7 +280,8 @@ const proof = await wallet.prove(plan, {
 ```
 
 Cancelling through the signal throws `AbortedError`, and it also cancels an artifact download that is
-still in flight. The same-thread prover can't interrupt snarkjs inside a phase, so it stops at the next
+still in flight. The signal reaches the [signer](./wallets#signers) too: if it fires while the signer
+is working, the SDK discards the signatures and never proves with them. The same-thread prover can't interrupt snarkjs inside a phase, so it stops at the next
 phase boundary. The worker prover terminates its worker instead (see [Adapters](./adapters#prover)).
 
 Each progress event carries a `phase` (`'witness'`, then `'proving'`) and a `fraction`. The fraction
