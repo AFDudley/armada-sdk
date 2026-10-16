@@ -81,6 +81,18 @@ describe('ExternalSigner (custody boundary is swappable)', () => {
     );
     await expect(bad.signBatch([req(1n), req(2n)])).rejects.toBeInstanceOf(SignerContractViolationError);
   });
+
+  it('forwards the abort signal to its backend (#140)', async () => {
+    // WHY: a backend waiting on human approval had no way to learn the proof was cancelled.
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const external = new ExternalSigner(
+      async (requests, options) => { seen = options?.signal; return requests.map(() => ({ R8: [1n, 2n], S: 3n })); },
+      async () => [1n, 2n],
+    );
+    await external.signBatch([req(1n)], { signal: controller.signal });
+    expect(seen).toBe(controller.signal);
+  });
 });
 
 describe('view-only identity (SPEC §4.2.2)', () => {

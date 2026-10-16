@@ -13,7 +13,7 @@ import {
   verifyEDDSA,
 } from '../core/index';
 import { createTransferNote, encryptNoteToReceiver, type CommitmentCiphertextV2 } from '../sync/index';
-import { SignerContractViolationError } from '../errors';
+import { AbortedError, SignerContractViolationError } from '../errors';
 import type { SpendSigner, SpendSignRequest, EddsaSignature } from '../wallet/index';
 import type { PlanSummary, DecodedBoundParams, CctpBinding } from './index';
 import type { CircuitShape } from '../prover/index';
@@ -183,13 +183,28 @@ function fullNetworkID(chainType: number, chainId: number): bigint {
  * caller-controlled and MUST be fee-first. Correctness of the circuit-field format is validated by the
  * tx chain differential; this builds the invariants (nullifiers, commitments, signature, hash) exactly.
  */
-export async function buildWitness(params: BuildWitnessParams): Promise<BuiltWitness> {
+export async function buildWitness(params: BuildWitnessParams, signal?: AbortSignal): Promise<BuiltWitness> {
   const prepared = await prepareWitness(params);
-  const [signature] = await params.signer.signBatch([prepared.signRequest]);
+  const [signature] = await signWithin(params.signer, [prepared.signRequest], signal);
   if (signature === undefined) {
     throw new SignerContractViolationError('buildWitness: signer returned no signature');
   }
   return prepared.finalize(signature);
+}
+
+/**
+ * Ask the signer for a batch, passing it `signal`. If the signal fired while the signer was working, the signatures are
+ * discarded and this throws `AbortedError`: a cancelled proof never goes on to prove with them.
+ */
+export async function signWithin(
+  signer: SpendSigner,
+  requests: readonly SpendSignRequest[],
+  signal: AbortSignal | undefined,
+): Promise<EddsaSignature[]> {
+  if (signal?.aborted) throw new AbortedError('sign: aborted before start');
+  const signatures = await signer.signBatch(requests, signal !== undefined ? { signal } : undefined);
+  if (signal?.aborted) throw new AbortedError('sign: aborted while the signer was signing');
+  return signatures;
 }
 
 // Whether `signature` is a valid EdDSA (Poseidon) signature of `message` under `publicKey`. A malformed signature (e.g. a

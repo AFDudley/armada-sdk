@@ -1,7 +1,7 @@
 // ABOUTME: prove() orchestration + ProofHandle (SPEC §4.6) — witness → artifacts → Groth16 proof →
 // ABOUTME: transact() calldata, wrapped in a handle that owns its calldata (no populate-time re-matching).
 
-import { buildWitness, prepareWitness, type BuildWitnessParams, type BuiltWitness } from './witness';
+import { buildWitness, prepareWitness, signWithin, type BuildWitnessParams, type BuiltWitness } from './witness';
 import { buildTransactCalldata, type TransactionData } from './serialize';
 import type { ArtifactSource, ProverAdapter, ProveOptions } from '../prover/index';
 import type { ProofHandle, TransactCalldata } from './index';
@@ -79,7 +79,7 @@ class ProvedTransaction implements ProofHandle {
  * `ProverAdapter`, and serialize the transact() calldata — returned as an inspectable `ProofHandle`.
  */
 export async function prove(params: ProveParams, options?: ProveOptions): Promise<ProofHandle> {
-  const witness = await buildWitness(params.witness);
+  const witness = await buildWitness(params.witness, options?.signal);
   return proveWitness(params, witness, options);
 }
 
@@ -99,7 +99,7 @@ export async function proveAll(params: readonly ProveParams[], options?: ProveOp
   }
 
   const prepared = await Promise.all(params.map((p) => prepareWitness(p.witness)));
-  const signatures = await signer.signBatch(prepared.map((p) => p.signRequest));
+  const signatures = await signWithin(signer, prepared.map((p) => p.signRequest), options?.signal);
   if (signatures.length !== prepared.length) {
     throw new SignerContractViolationError(
       `proveAll: signer returned ${signatures.length} signatures for ${prepared.length} intents`,

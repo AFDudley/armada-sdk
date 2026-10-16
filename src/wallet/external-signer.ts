@@ -1,12 +1,15 @@
 // ABOUTME: ExternalSigner test double (SPEC §4.2.1) — a SpendSigner that delegates to an injected
 // ABOUTME: backend, standing in for an out-of-process signer (HSM/enclave/policy-gated) in tests.
 
-import type { SpendSigner, SpendSignRequest, EddsaSignature } from './index';
+import type { SpendSigner, SpendSignRequest, SpendSignOptions, EddsaSignature } from './index';
 import { assertValidBabyJubjubPublicKey } from './keys-validate';
 import { SignerContractViolationError } from '../errors';
 
-/** Signature backend: receives the ENTIRE batch of intents at once, returns one signature per request. */
-export type SignBackend = (requests: readonly SpendSignRequest[]) => Promise<EddsaSignature[]>;
+/**
+ * Signature backend: receives the ENTIRE batch of intents at once, returns one signature per request. `options.signal`
+ * fires if the SDK stops wanting the signatures; a backend waiting on approval should stop and reject.
+ */
+export type SignBackend = (requests: readonly SpendSignRequest[], options?: SpendSignOptions) => Promise<EddsaSignature[]>;
 export type PublicKeyBackend = () => Promise<[bigint, bigint]>;
 
 /**
@@ -29,8 +32,8 @@ export class ExternalSigner implements SpendSigner {
     return point;
   }
 
-  async signBatch(requests: readonly SpendSignRequest[]): Promise<EddsaSignature[]> {
-    const signatures = await this.signBackend(requests);
+  async signBatch(requests: readonly SpendSignRequest[], options?: SpendSignOptions): Promise<EddsaSignature[]> {
+    const signatures = await this.signBackend(requests, options);
     if (signatures.length !== requests.length) {
       throw new SignerContractViolationError(
         `ExternalSigner: backend returned ${signatures.length} signatures for ${requests.length} requests`,

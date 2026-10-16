@@ -10,7 +10,7 @@ import { createTransferNote } from '../sync/index';
 import { prove, proveAll } from './prove';
 import { buildTransactCalldata, transactionToTuple } from './serialize';
 import { decodeTransact } from './decode';
-import { ProofHandleInvalidatedError, ProofExpiredError, SignerContractViolationError, InvalidRequestError, ProofVerificationError } from '../errors';
+import { ProofHandleInvalidatedError, ProofExpiredError, SignerContractViolationError, InvalidRequestError, ProofVerificationError, AbortedError } from '../errors';
 import { hashSpendBoundParams, type BuildWitnessParams } from './witness';
 import type { ArtifactSource, ArtifactSet, ProverAdapter, Groth16Proof, CircuitShape } from '../prover/index';
 import type { PlanSummary } from './index';
@@ -184,6 +184,47 @@ describe('prove() + ProofHandle (§4.6)', () => {
       const err = await prove({ witness: await witnessParams(), artifacts, prover, poolAddress: POOL }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(ProofVerificationError);
       expect((err as Error).cause).toBe(boom);
+    });
+  });
+
+  describe('cancelling during signing (#140)', () => {
+    // WHY: the signer got no abort signal, so a cancelled proof still collected signatures — which never expire
+    // until an input is spent — and went on to prove with them.
+    const artifacts: ArtifactSource = { resolve: async () => DUMMY_ARTIFACTS };
+    // A signer that cancels the proof while "awaiting approval", then signs anyway, recording the options it got.
+    const cancellingSigner = (controller: AbortController, seen: { signal?: AbortSignal }[]): SpendSigner => ({
+      getSpendingPublicKey: () => signer.getSpendingPublicKey(),
+      signBatch: async (requests, options) => {
+        seen.push(options ?? {});
+        controller.abort();
+        return signer.signBatch(requests);
+      },
+    });
+
+    it('prove passes the signal to the signer, and discards signatures that arrive after a cancel', async () => {
+      const controller = new AbortController();
+      const seen: { signal?: AbortSignal }[] = [];
+      let proveCalls = 0;
+      const prover: ProverAdapter = { prove: async () => { proveCalls += 1; return DUMMY_PROOF; }, verify: async () => true, close: async () => {} };
+      const witness = { ...(await witnessParams()), signer: cancellingSigner(controller, seen) };
+      await expect(prove({ witness, artifacts, prover, poolAddress: POOL }, { signal: controller.signal })).rejects.toBeInstanceOf(AbortedError);
+      expect(seen[0]?.signal).toBe(controller.signal);
+      expect(proveCalls).toBe(0);
+    });
+
+    it('proveAll does the same for a batch', async () => {
+      const controller = new AbortController();
+      const seen: { signal?: AbortSignal }[] = [];
+      const prover: ProverAdapter = { prove: async () => DUMMY_PROOF, verify: async () => true, close: async () => {} };
+      const cancelling = cancellingSigner(controller, seen);
+      const groups = [await witnessParams(), await witnessParams()].map((w) => ({ witness: { ...w, signer: cancelling }, artifacts, prover, poolAddress: POOL }));
+      await expect(proveAll(groups, { signal: controller.signal })).rejects.toBeInstanceOf(AbortedError);
+      expect(seen).toEqual([{ signal: controller.signal }]);
+    });
+
+    it('LocalSigner refuses to sign once the signal has fired', async () => {
+      const prepared = await witnessParams();
+      await expect(prepared.signer.signBatch([], { signal: AbortSignal.abort() })).rejects.toBeInstanceOf(AbortedError);
     });
   });
 

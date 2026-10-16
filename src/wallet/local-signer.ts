@@ -3,8 +3,8 @@
 
 import { signEDDSA } from '../core/index';
 import { deriveKeyset, deriveKeysetFromMnemonic, type Keyset } from './derive';
-import { InvalidRequestError } from '../errors';
-import type { SpendSigner, SpendSignRequest, EddsaSignature } from './index';
+import { AbortedError, InvalidRequestError } from '../errors';
+import type { SpendSigner, SpendSignRequest, SpendSignOptions, EddsaSignature } from './index';
 
 /**
  * In-process signer derived from the wallet's rootSecret. It receives the entire batch of
@@ -43,8 +43,9 @@ export class LocalSigner implements SpendSigner {
     return [this.spendingPublicKey[0], this.spendingPublicKey[1]];
   }
 
-  async signBatch(requests: readonly SpendSignRequest[]): Promise<EddsaSignature[]> {
+  async signBatch(requests: readonly SpendSignRequest[], options?: SpendSignOptions): Promise<EddsaSignature[]> {
     if (this.disposed) throw new InvalidRequestError('LocalSigner: used after dispose()');
+    if (options?.signal?.aborted) throw new AbortedError('LocalSigner: aborted before signing');
     return requests.map((request) => {
       const sig = signEDDSA(this.spendingPrivateKey, request.message);
       return { R8: [sig.R8[0], sig.R8[1]] as [bigint, bigint], S: sig.S };

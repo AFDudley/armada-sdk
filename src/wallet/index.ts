@@ -18,6 +18,15 @@ export interface SpendSignRequest {
   readonly context: SpendIntentContext;
 }
 
+/** Per-call options for `SpendSigner.signBatch`. */
+export interface SpendSignOptions {
+  /**
+   * Fires when the SDK no longer wants the signatures (the proof was cancelled). A signer that waits on a human or a
+   * remote service should stop waiting and reject. The SDK discards any signatures returned after it fires.
+   */
+  readonly signal?: AbortSignal;
+}
+
 /**
  * Custody boundary (SPEC §4.2.1). Batch semantics are part of the contract: the signer receives the
  * ENTIRE batch of fully-bound intents before releasing ANY signature — "approve one signature =
@@ -26,7 +35,7 @@ export interface SpendSignRequest {
  */
 export interface SpendSigner {
   getSpendingPublicKey(): Promise<[bigint, bigint]>;
-  signBatch(requests: readonly SpendSignRequest[]): Promise<EddsaSignature[]>;
+  signBatch(requests: readonly SpendSignRequest[], options?: SpendSignOptions): Promise<EddsaSignature[]>;
   /** Optional: release/zeroize held key material (SPEC §4.2). A disposed signer refuses to sign. */
   dispose?(): void;
 }
