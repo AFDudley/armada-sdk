@@ -28,7 +28,7 @@ import {
   newReceivedNotes,
   saveScanState,
   loadScanState,
-  scanStateKey,
+  SCAN_STATE_KEY,
   PendingSpends,
   loadPendingSpends,
   savePendingSpends,
@@ -49,6 +49,7 @@ import {
   type ProveParams,
 } from './internal/index';
 import type { StorageAdapter } from './storage/index';
+import { ScopedStore } from './storage/scoped';
 import { isCrossChainUnshield, type Plan, type PlanSelection, type ProofHandle, type PreflightResult } from './tx/index';
 import { planConsolidate, txosAfterConsolidation } from './tx/consolidate';
 import { maxTransferAmount, maxUnshieldAmount } from './tx/max-transfer';
@@ -241,22 +242,26 @@ export function quickSyncTelemetry(input: {
   };
 }
 
+// The storage layout version, part of the deployment namespace: a store written under another version is reset
+// (chain-derived records wiped and rebuilt by a rescan). 2: wallet records moved under per-wallet scopes (#138).
+const STORAGE_SCHEMA_VERSION = 2;
+
 /**
- * Resolve the per-wallet storage handle. By default the raw environment adapter is auto-wrapped in an
- * `EncryptedStore` keyed per wallet (from the viewing private key), so decrypted note data is
- * AEAD-encrypted at rest without the caller doing anything (SPEC §4.3, WS7.2 Option B). A per-wallet
- * key (not one instance-wide key) means one wallet cannot read another's records even in a shared
- * adapter. `allowPlaintext` (the `dangerouslyAllowPlaintextStorage` config flag) returns the raw
- * adapter unwrapped — the only path to plaintext at rest. Exported so the auto-wrap default is
- * unit-testable without a live chain.
+ * Resolve the per-wallet storage handle: the wallet's own scope of the shared adapter (`ScopedStore`, tagged with
+ * the wallet's opaque record id), so wallets sharing an adapter can't list, overwrite or decrypt each other's
+ * records (SPEC §4.3, WS-2). By default the scope wraps an `EncryptedStore` keyed per wallet (from the viewing
+ * private key), so decrypted note data is AEAD-encrypted at rest without the caller doing anything (WS7.2
+ * Option B), with the full scoped key as the AAD. `allowPlaintext` (the `dangerouslyAllowPlaintextStorage` config
+ * flag) drops only the encryption — the only path to plaintext at rest. Exported so the defaults are unit-testable
+ * without a live chain.
  */
 export function resolveWalletStorage(
   raw: StorageAdapter,
   viewingPrivateKey: Uint8Array,
   allowPlaintext: boolean,
 ): StorageAdapter {
-  if (allowPlaintext) return raw;
-  return new EncryptedStore(raw, deriveWalletStorageKey(viewingPrivateKey));
+  const values = allowPlaintext ? raw : new EncryptedStore(raw, deriveWalletStorageKey(viewingPrivateKey));
+  return new ScopedStore(values, walletRecordId(viewingPrivateKey));
 }
 
 /**
@@ -392,15 +397,13 @@ class ArmadaWallet implements Wallet {
     // later would hit the first earlier commitment as a position gap. `creationBlock` only limits which
     // notes the wallet looks for (see `decryptors`).
     this.syncedThrough = ctx.deployBlock - 1;
-    // Per-wallet at-rest encryption is on by default; the raw adapter is auto-wrapped (§4.3).
+    // This wallet's own scope of the shared adapter, encrypted at rest by default (§4.3).
     this.storage = resolveWalletStorage(ctx.storage, keyset.viewingPrivateKey, ctx.allowPlaintextStorage);
-    this.recordId = walletRecordId(keyset.viewingPrivateKey);
   }
 
-  // This wallet's storage handle — an EncryptedStore wrapping the shared adapter unless plaintext is allowed.
+  // This wallet's storage handle: its own scope of the shared adapter (under its opaque record id, never the 0zk
+  // address — record keys are plaintext, §4.3), wrapping an EncryptedStore unless plaintext is allowed.
   private readonly storage: StorageAdapter;
-  // Opaque id naming this wallet's records at rest — never the 0zk address (record keys are plaintext, §4.3).
-  private readonly recordId: string;
 
   get shieldedAddress(): string {
     return this.keyset.shieldedAddress;
@@ -426,7 +429,7 @@ class ArmadaWallet implements Wallet {
    */
   async load(): Promise<void> {
     if (this.ephemeral) return;
-    const persisted = await loadScanState(this.storage, this.recordId);
+    const persisted = await loadScanState(this.storage);
     if (persisted !== undefined && persisted.syncedThrough > this.syncedThrough) {
       this.scanState = persisted.state;
       this.syncedThrough = persisted.syncedThrough;
@@ -436,7 +439,7 @@ class ArmadaWallet implements Wallet {
       newReceivedNotes(this.scanState.ownedTxos(), this.scanState.spentNullifiers(), this.keyset.nullifyingKey, this.seenReceiveKeys);
       this.receiveBaselined = true;
     }
-    this.holds = await loadPendingSpends(this.storage, this.recordId);
+    this.holds = await loadPendingSpends(this.storage);
     // A hold whose spend the saved state already confirms is done.
     this.holds.releaseConfirmed(this.scanState.spentNullifiers());
   }
@@ -712,7 +715,7 @@ class ArmadaWallet implements Wallet {
 
       // Ephemeral wallets keep their scan state in memory only — never write note data to disk (SPEC §6.5).
       if (!this.ephemeral) {
-        await saveScanState(this.storage, this.recordId, next, head, headHash);
+        await saveScanState(this.storage, next, head, headHash);
       }
       // Commit: only now — verified and saved — does the new state become the one readers see, and the
       // checkpoint advance. A save failure above leaves both where they were.
@@ -762,7 +765,7 @@ class ArmadaWallet implements Wallet {
     this.seenReceiveKeys.clear();
     this.receiveBaselined = false;
     // Delete the poisoned record so a crash mid-rescan can't load it again.
-    if (!this.ephemeral) await this.storage.del(scanStateKey(this.recordId));
+    if (!this.ephemeral) await this.storage.del(SCAN_STATE_KEY);
   }
 
   // Push `note:received` for incoming transfers discovered since the last sync (`newReceivedNotes`
@@ -1189,7 +1192,7 @@ class ArmadaWallet implements Wallet {
 
   // Write the holds record — awaited, so a resolved markSpendPending/clearSpendPending is durable.
   private async saveHolds(): Promise<void> {
-    if (!this.ephemeral) await savePendingSpends(this.storage, this.recordId, this.holds);
+    if (!this.ephemeral) await savePendingSpends(this.storage, this.holds);
   }
 
   // After a sync commits, holds whose spend it confirmed (their `Nullified` event is in) are done.
@@ -1252,7 +1255,7 @@ export async function createArmadaSdk(config: ArmadaSdkConfig): Promise<ArmadaSd
   const telemetry = safeTelemetry(config.telemetry);
 
   // Namespace the store by (schema, chain, pool, deployBlock); a mismatch resets chain-derived state.
-  const { reset } = await config.storage.open({ schemaVersion: 1, chainId: config.pool.chainId, poolAddress: config.pool.poolAddress, deployBlock: config.pool.deployBlock });
+  const { reset } = await config.storage.open({ schemaVersion: STORAGE_SCHEMA_VERSION, chainId: config.pool.chainId, poolAddress: config.pool.poolAddress, deployBlock: config.pool.deployBlock });
   if (reset) {
     // Surface redeploy resets so an operator can see chain-derived state being wiped (SPEC §8-safe:
     // public chain config only, no keys/addresses/amounts).

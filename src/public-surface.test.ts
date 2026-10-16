@@ -30,12 +30,12 @@ function typeNames(dts: string): string[] {
 
 // The building blocks moved off the root (the #129 allow-list). They're reachable only via `@armada/sdk/internal`.
 const INTERNAL = [
-  'WalletScanState', 'saveScanState', 'loadScanState', 'scanStateKey', 'UTXOMerkletree', 'SyncEmitter', 'startAutoSync',
+  'WalletScanState', 'saveScanState', 'loadScanState', 'SCAN_STATE_KEY', 'UTXOMerkletree', 'SyncEmitter', 'startAutoSync',
   'decodePoolEvents', 'formatShieldEvent', 'formatTransactEvent', 'formatNullifiedEvent', 'formatCommitmentCiphertext',
   'POOL_V2_EVENT_ABI', 'fetchLogsRanged', 'RpcEventSource', 'IndexerEventSource', 'computeBalances', 'withTokenAddresses',
   'newReceivedNotes', 'ownSpendTxids', 'ownedNoteFromTransactNote', 'txoFromNote', 'tryDecryptShield',
   'decryptedCommitmentMatches', 'shieldCommitmentMatches', 'tokenHashKey', 'PendingSpends', 'loadPendingSpends',
-  'savePendingSpends', 'pendingSpendsKey', 'EncryptedStore', 'deriveStorageKey', 'deriveWalletStorageKey', 'walletRecordId',
+  'savePendingSpends', 'PENDING_SPENDS_KEY', 'EncryptedStore', 'ScopedStore', 'deriveStorageKey', 'deriveWalletStorageKey', 'walletRecordId',
   'planTransfer', 'planConsolidate', 'planSpend', 'planWitnessInputs', 'buildWitness', 'prove', 'proveAll',
   'maxTransferAmount', 'maxUnshieldAmount', 'txosAfterConsolidation', 'runPreflight', 'readShieldsPaused', 'hashSpendBoundParams',
 ];

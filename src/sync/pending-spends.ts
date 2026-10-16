@@ -69,10 +69,9 @@ export class PendingSpends {
   }
 }
 
-// `chain/` prefix: holds point at chain-derived notes, so a redeploy reset (resetChainState) drops them too.
-export function pendingSpendsKey(recordId: string): string {
-  return `chain/pending-spends/${recordId}`;
-}
+// `chain/`: holds point at chain-derived notes, so a redeploy reset (resetChainState) drops them too. Per wallet
+// because `storage` is the wallet's scoped store.
+export const PENDING_SPENDS_KEY = 'chain/pending-spends';
 
 interface PersistedHold {
   readonly tree: number;
@@ -84,26 +83,29 @@ interface PersistedHold {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** Write the holds record (deleted when there are none). Resolves once the adapter has accepted the write. */
-export async function savePendingSpends(storage: StorageAdapter, recordId: string, holds: PendingSpends): Promise<void> {
+/**
+ * Write the holds record (deleted when there are none), DURABLY: it resolves once the write is committed to disk.
+ * A lost hold re-exposes an in-flight note to the planner, which then proves a spend that can't land.
+ */
+export async function savePendingSpends(storage: StorageAdapter, holds: PendingSpends): Promise<void> {
   const list = holds.list();
   if (list.length === 0) {
-    await storage.del(pendingSpendsKey(recordId));
+    await storage.batch([{ type: 'del', key: PENDING_SPENDS_KEY }], { durable: true });
     return;
   }
   const data: PersistedHold[] = list.map((h) => ({ tree: h.tree, nullifier: h.nullifier.toString(), txid: h.txid, addedAt: h.addedAt }));
-  await storage.put(pendingSpendsKey(recordId), encoder.encode(JSON.stringify(data)));
+  await storage.batch([{ type: 'put', key: PENDING_SPENDS_KEY, value: encoder.encode(JSON.stringify(data)) }], { durable: true });
 }
 
 /**
  * Load the holds record, or an empty set on a first run or an unreadable record — a lost hold only
  * re-exposes the note to selection (preflight still catches a spent input), so it must not brick loading.
  */
-export async function loadPendingSpends(storage: StorageAdapter, recordId: string): Promise<PendingSpends> {
+export async function loadPendingSpends(storage: StorageAdapter): Promise<PendingSpends> {
   const holds = new PendingSpends();
   let raw: Uint8Array | undefined;
   try {
-    raw = await storage.get(pendingSpendsKey(recordId));
+    raw = await storage.get(PENDING_SPENDS_KEY);
   } catch {
     return holds;
   }
