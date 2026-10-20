@@ -14,7 +14,7 @@ dispatcher:
 # VitePress) is left out: it is a separate CI job, not a build/test gate on
 # behaviour.
 gate:
-  command: ["bash", "-c", "pre-commit run --all-files && npm run lint && npm run typecheck && npm run typecheck:vendor && npm run build && npm test && (grep -rn 'POI' src/ vendor/ | grep -v 'POINTS' && exit 1 || true) && node scripts/check-vendor-divergence.mjs"]
+  command: ["bash", "-c", "npm ci --offline --no-audit --no-fund && pre-commit run --all-files && npm run lint && npm run typecheck && npm run typecheck:vendor && npm run build && npm test && (grep -rn 'POI' src/ vendor/ | grep -v 'POINTS' && exit 1 || true) && node scripts/check-vendor-divergence.mjs"]
   timeout: 150
 
 # Where `exophial spec generate` writes unified spec instances (repo-relative).
