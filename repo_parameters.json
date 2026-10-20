@@ -1,0 +1,16 @@
+{
+  "git_remote": "origin",
+  "subtrees": [],
+  "pebble_tracker_prefixes": {
+    "root": "ars-"
+  },
+  "commit_trailer_categories": [
+    "hygiene",
+    "refactor",
+    "docs",
+    "infrastructure",
+    "pebble-filing"
+  ],
+  "gate_commands": {},
+  "deploy_surfaces": {}
+}
