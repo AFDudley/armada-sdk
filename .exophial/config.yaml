@@ -1,9 +1,10 @@
-coordination_repo: ""
+coordination_repo: "/home/rix/code/git_puller/repos/armada-sdk"
 poll_interval: 5
 inspect_interval: 5
 
 dispatcher:
-  max_workers: 10
+  backend: omp
+  max_workers: 1
   task_timeout: 3600
 
 # Commit-boundary acceptance gate the integrator re-runs in-worktree for pebbles
@@ -58,7 +59,7 @@ intake_derivation:
 # (context_fit_gate.omp_route: a Claude backend's model is `anthropic/<id>`).
 worker_model:
   tiers:
-    default: "claude-sonnet-5"
+    default: "pool/5090"
     frontier: "claude-opus-5"
   routing:
     default: default
@@ -86,3 +87,11 @@ llm_transport:
   # provider: ""     # omp_rpc only: omp provider (e.g. "anthropic", "vllm")
   # base_url: ""     # vllm only: server address (default http://localhost:8000/v1)
   # cli_path: ""     # omp_rpc only: built omp-structured dist/cli.js (required for that backend)
+
+# Per-tier omp tool allow-list (exo-b668/exo-3be), passed to the worker as --tools.
+# The pool/5090 qwen worker reread files with `read` until its context overflowed
+# (arn-bcc: one file 43 times, peak 161k tokens); with only bash/grep/glob it reads
+# and writes files through bash.
+workers:
+  default:
+    tools: [bash, grep, glob]
