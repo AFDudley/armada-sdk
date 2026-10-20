@@ -19,3 +19,9 @@
 {"type":"comment","timestamp":"2026-10-20T13:53:46.234648Z","issue_id":"ars-4ad","payload":{"body":"spec: contracts/specs/derived-ars-4ad.spec.json"}}
 {"type":"comment","timestamp":"2026-10-20T13:53:46.234982Z","issue_id":"ars-4ad","payload":{"body":"intake-status: complete"}}
 {"type":"comment","timestamp":"2026-10-20T13:53:46.235194Z","issue_id":"ars-4ad","payload":{"body":"exophial-cli-authoring-complete: "}}
+{"type":"comment","timestamp":"2026-10-20T14:02:03.021868Z","issue_id":"ars-4ad","payload":{"base_sha":"7a94746def1b9c1150e6e703f2d46234dc0ae311","body":"base-sha: 7a94746def1b9c1150e6e703f2d46234dc0ae311","verdict_kind":"base_sha"}}
+{"type":"create","timestamp":"2026-10-20T15:13:58.734238Z","issue_id":"ars-e78","payload":{"description":"Operator-authored branch `hand/c6-wallet-ragequit`, landed via `exophial integrate --branch` — no pebble id already tracked it.","priority":"2","title":"land: hand/c6-wallet-ragequit","type":"task"}}
+{"type":"comment","timestamp":"2026-10-20T15:13:58.738520Z","issue_id":"ars-e78","payload":{"body":"branch-identity: hand/c6-wallet-ragequit"}}
+{"type":"comment","timestamp":"2026-10-20T15:14:51.511524Z","issue_id":"ars-e78","payload":{"body":"exophial-integration-attempt-started: at 7a94746def1b9c1150e6e703f2d46234dc0ae311"}}
+{"type":"comment","timestamp":"2026-10-20T15:14:55.182899Z","issue_id":"ars-e78","payload":{"body":"exophiald: merged (merged_ff).\n\nexophial-verdict: {\"verdict\": \"pass\"}"}}
+{"type":"close","timestamp":"2026-10-20T15:14:55.183197Z","issue_id":"ars-e78","payload":{"outcome":"merged_ff","reason":"clean fast-forward merge; no rebase was needed"}}
