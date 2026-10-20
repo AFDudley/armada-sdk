@@ -1,0 +1,249 @@
+{
+  "id": "derived-ars-4ad",
+  "original_statement": "What must hold? State the invariant or expectation this concerns. A wallet holding ARM can call ShieldedRagequit.ragequit, recognize the resulting contract-owned payout note on-device, and spend it, with no server-side proving step. A planRagequit function computes the ragequit calldata and the expected CommitmentPreimage for each asset, with the same bound the contract enforces: armAmount * safe.balanceOf(token) / armToken.totalSupply(). The wallet recognizes the payout note from preimageOf in the clear, with no ciphertext decrypt, and inserts it into the local note store. The note then spends through planSpend, prove, and buildTransactCalldata with no special case.\nWhat holds now? Describe the current, observed state. armada-sdk has no planRagequit. src/tx/plan.ts exports planTransfer and planSpend only. No step reads preimageOf for a contract-owned note or inserts it into the note store without a ciphertext. No test shields a note, ragequits, and spends the payout note. The integrated HEAD has no ragequit support in the SDK.\nHow do you see it? Describe exactly how to observe this for yourself \u2014 the steps to reproduce, or how you would demo it. Run the SDK test runner, vitest run, on a new test file src/tx/ragequit.test.ts. Case 1: planRagequit computes the same bound the contract enforces, for a mocked Safe balance and ARM supply. Case 2: the note-recognition step inserts a contract-owned note from preimageOf, with no ciphertext decrypt attempted. Case 3: an end-to-end test shields a note, ragequits against a local ShieldedRagequit deployment, and spends the resulting note, and the final transact call's proof verifies. Each case fails on the current integrated HEAD and passes after the change.\nWhat constraints apply? State them in plain prose. Depends on G3 (ShieldedRagequit), merged in armada-poc. Match plan.ts's signature shape: a PlanTransferParams-style input object and a Plan or PlanSelection return type. Keep proof building device-local: add no network call to a proving service. Do not invent a second note store: insert through the existing src/sync/ note-insertion shape. The payout note has no ciphertext; never attempt to decrypt one for a contract-owned note. planRagequit's predicted payout must match G3's on-chain bound exactly. Follow armada-poc/docs/tasks/C6-wallet-shielded-ragequit.md steps S1 through S3.\nWhere does this apply? (e.g. gateway route, mobile screen, CLI verb) armada-sdk/src/tx/ (planRagequit in plan.ts), armada-sdk/src/sync/ (note recognition), src/tx/ragequit.test.ts",
+  "restatement": "The SDK must let a wallet that holds ARM call ShieldedRagequit.ragequit, recognize the contract-owned payout note on the device, and spend it. No server-side proving step is allowed. A new planRagequit function must compute the ragequit calldata and the expected CommitmentPreimage for each asset, using the same bound the contract enforces: armAmount * safe.balanceOf(token) / armToken.totalSupply(). The wallet must read the payout note from preimageOf in the clear, never decrypt a ciphertext, and insert the note into the existing local note store. The note must then spend through planSpend, prove, and buildTransactCalldata with no special case. It depends on G3 (ShieldedRagequit) in armada-poc and follows armada-poc/docs/tasks/C6-wallet-shielded-ragequit.md steps S1 to S3.",
+  "restatement_clauses": [
+    {
+      "id": "c1",
+      "text": "planRagequit computes the ragequit calldata and the expected CommitmentPreimage for each asset, and its predicted payout equals exactly the bound the contract enforces: armAmount * safe.balanceOf(token) / armToken.totalSupply()."
+    },
+    {
+      "id": "c2",
+      "text": "The wallet recognizes the contract-owned payout note from preimageOf in the clear, with no ciphertext decrypt attempted, and inserts it into the local note store through the existing src/sync/ note-insertion shape, with no second note store."
+    },
+    {
+      "id": "c3",
+      "text": "A note shielded, then ragequit against a local ShieldedRagequit deployment, then spent through planSpend, prove, and buildTransactCalldata with no special case, produces a final transact call whose proof verifies."
+    },
+    {
+      "id": "c4",
+      "text": "Proof building stays device-local: no network call to a proving service is made during ragequit planning, recognition, or the spend."
+    },
+    {
+      "id": "c5",
+      "text": "planRagequit is exported from src/tx/plan.ts and matches its signature shape: a PlanTransferParams-style input object and a Plan or PlanSelection return type."
+    }
+  ],
+  "goal": "A wallet can ragequit ARM into shielded payout notes, recognize them on-device from preimageOf, and spend them with device-local proving.",
+  "acceptance_criteria": [
+    "With a made-up Safe balance and ARM supply, the planned payout for each asset equals the contract formula, including when the division does not come out even.",
+    "A contract-owned payout note is added to the wallet's note store from its plain preimage, and no decrypt was tried.",
+    "A note is shielded, ragequit against a local ShieldedRagequit deployment, then spent, and the final transact proof checks out.",
+    "While planning, recognizing, and spending a ragequit payout, no request goes to any proving service.",
+    "The planning module offers a planRagequit function that takes one input object and returns a plan, like the other planning functions."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "With a made-up Safe balance and ARM supply, the planned payout for each asset equals the contract formula, including when the division does not come out even."
+    },
+    {
+      "id": "c2",
+      "text": "A contract-owned payout note is added to the wallet's note store from its plain preimage, and no decrypt was tried."
+    },
+    {
+      "id": "c3",
+      "text": "A note is shielded, ragequit against a local ShieldedRagequit deployment, then spent, and the final transact proof checks out."
+    },
+    {
+      "id": "c4",
+      "text": "While planning, recognizing, and spending a ragequit payout, no request goes to any proving service."
+    },
+    {
+      "id": "c5",
+      "text": "The planning module offers a planRagequit function that takes one input object and returns a plan, like the other planning functions."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "description": "With a made-up Safe balance and ARM supply, the planned payout for each asset equals the contract formula, including when the division does not come out even.",
+      "proves": "The planned payout matches the on-chain bound exactly (clause c1).",
+      "restatement_clause_id": "c1",
+      "type": "behavior",
+      "when": {
+        "interpreter": "node",
+        "script": "scripts/check-ragequit-bound.mjs",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "payout_matches_contract_bound",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "assets_checked",
+          "op": "ge",
+          "value": 2
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 120,
+      "clause_id": "c1"
+    },
+    {
+      "description": "A contract-owned payout note is added to the wallet's note store from its plain preimage, and no decrypt was tried.",
+      "proves": "Recognition works from preimageOf without ciphertext and uses the existing note store (clause c2).",
+      "restatement_clause_id": "c2",
+      "type": "behavior",
+      "when": {
+        "interpreter": "node",
+        "script": "scripts/check-ragequit-recognition.mjs",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "decrypt_attempts",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "note_inserted",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "note_store_count",
+          "op": "eq",
+          "value": 1
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 120,
+      "clause_id": "c2"
+    },
+    {
+      "description": "A note is shielded, ragequit against a local ShieldedRagequit deployment, then spent, and the final transact proof checks out.",
+      "proves": "The payout note spends end to end with no special case (clause c3).",
+      "restatement_clause_id": "c3",
+      "type": "behavior",
+      "when": {
+        "interpreter": "node",
+        "script": "scripts/check-ragequit-e2e.mjs",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "payout_note_spent",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "proof_verified",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 900,
+      "clause_id": "c3"
+    },
+    {
+      "description": "While planning, recognizing, and spending a ragequit payout, no request goes to any proving service.",
+      "proves": "Proving stays on the device (clause c4).",
+      "restatement_clause_id": "c4",
+      "type": "behavior",
+      "when": {
+        "interpreter": "node",
+        "script": "scripts/check-ragequit-no-network-prover.mjs",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "prover_network_calls",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 900,
+      "clause_id": "c4"
+    },
+    {
+      "description": "The planning module offers a planRagequit function that takes one input object and returns a plan, like the other planning functions.",
+      "proves": "planRagequit is exported from src/tx/plan.ts with the same shape as planTransfer and planSpend (clause c5).",
+      "restatement_clause_id": "c5",
+      "type": "behavior",
+      "when": {
+        "interpreter": "node",
+        "script": "scripts/check-ragequit-api-shape.mjs",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "plan_ragequit_exported",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "takes_single_params_object",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "returns_plan_shape",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 120,
+      "clause_id": "c5"
+    }
+  ],
+  "criticality": "marginal",
+  "verification_level": "bounded_model_check",
+  "declared_new_entrypoints": [
+    "scripts/check-ragequit-api-shape.mjs",
+    "scripts/check-ragequit-bound.mjs",
+    "scripts/check-ragequit-e2e.mjs",
+    "scripts/check-ragequit-no-network-prover.mjs",
+    "scripts/check-ragequit-recognition.mjs"
+  ]
+}
