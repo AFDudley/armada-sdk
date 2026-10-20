@@ -8,9 +8,14 @@ dispatcher:
 
 # Commit-boundary acceptance gate the integrator re-runs in-worktree for pebbles
 # with NO linked spec (a linked spec is graded in-process by spec_oracle.run_spec).
-# gate:
-#   command: ["your-static-gate-command"]
-#   timeout: 1800
+# Mirrors the CI `build-test` job (.github/workflows/ci.yml): lint, typecheck
+# (app + vendored railgun-engine), build, the vitest suite, the PPOI strip
+# guard, and the vendored-file divergence check. The CI `docs` job (TypeDoc +
+# VitePress) is left out: it is a separate CI job, not a build/test gate on
+# behaviour.
+gate:
+  command: ["bash", "-c", "pre-commit run --all-files && npm run lint && npm run typecheck && npm run typecheck:vendor && npm run build && npm test && (grep -rn 'POI' src/ vendor/ | grep -v 'POINTS' && exit 1 || true) && node scripts/check-vendor-divergence.mjs"]
+  timeout: 150
 
 # Where `exophial spec generate` writes unified spec instances (repo-relative).
 spec_dir: "contracts/specs"
