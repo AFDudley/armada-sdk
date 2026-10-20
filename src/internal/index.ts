@@ -30,6 +30,8 @@ export { tryDecryptShield, shieldCommitmentMatches } from '../sync/shield-crypto
 export { computeBalances, txoFromNote, tokenHashKey, withTokenAddresses } from '../sync/balances';
 export type { PendingSpend, BalanceOptions } from '../sync/balances';
 export { newReceivedNotes, ownSpendTxids } from '../sync/history';
+export { recognizeRagequitNote, ragequitNoteCommitment } from '../sync/ragequit-note';
+export type { RagequitNotePreimage, RagequitNoteContext } from '../sync/ragequit-note';
 
 // ── Pending-spend holds ──
 export { PendingSpends, savePendingSpends, loadPendingSpends, PENDING_SPENDS_KEY } from '../sync/pending-spends';
@@ -39,8 +41,11 @@ export { EncryptedStore, deriveStorageKey, deriveWalletStorageKey, walletRecordI
 export { ScopedStore } from '../storage/scoped';
 
 // ── Planning & proving pipeline (the wallet methods are the public API) ──
-export { planTransfer, planSpend, planWitnessInputs } from '../tx/plan';
-export type { PlanTransferParams, TransferOutputRequest, FeeRequest } from '../tx/plan';
+export { planTransfer, planSpend, planWitnessInputs, planRagequit } from '../tx/plan';
+export type {
+  PlanTransferParams, TransferOutputRequest, FeeRequest,
+  PlanRagequitParams, PlanRagequitResult, RagequitAsset,
+} from '../tx/plan';
 export { planConsolidate, txosAfterConsolidation } from '../tx/consolidate';
 export type { PlanConsolidateParams } from '../tx/consolidate';
 export { maxTransferAmount, maxUnshieldAmount } from '../tx/max-transfer';

@@ -177,3 +177,11 @@ export class InvalidConfigError extends ArmadaError {
 export class SignerContractViolationError extends ArmadaError {
   readonly code = 'SIGNER_CONTRACT_VIOLATION';
 }
+
+/**
+ * A recognized ragequit payout preimage does not hash to the commitment `planRagequit` predicted (C6 S2).
+ * The on-chain note is not the one the wallet planned, so inserting it would corrupt the note store.
+ */
+export class RagequitPreimageMismatchError extends ArmadaError {
+  readonly code = 'RAGEQUIT_PREIMAGE_MISMATCH';
+}

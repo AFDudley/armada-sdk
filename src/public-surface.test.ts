@@ -36,7 +36,7 @@ const INTERNAL = [
   'newReceivedNotes', 'ownSpendTxids', 'ownedNoteFromTransactNote', 'txoFromNote', 'tryDecryptShield',
   'decryptedCommitmentMatches', 'shieldCommitmentMatches', 'tokenHashKey', 'PendingSpends', 'loadPendingSpends',
   'savePendingSpends', 'PENDING_SPENDS_KEY', 'EncryptedStore', 'ScopedStore', 'deriveStorageKey', 'deriveWalletStorageKey', 'walletRecordId',
-  'planTransfer', 'planConsolidate', 'planSpend', 'planWitnessInputs', 'buildWitness', 'prove', 'proveAll',
+  'planTransfer', 'planConsolidate', 'planSpend', 'planWitnessInputs', 'planRagequit', 'recognizeRagequitNote', 'ragequitNoteCommitment', 'buildWitness', 'prove', 'proveAll',
   'maxTransferAmount', 'maxUnshieldAmount', 'txosAfterConsolidation', 'runPreflight', 'readShieldsPaused', 'hashSpendBoundParams',
 ];
 

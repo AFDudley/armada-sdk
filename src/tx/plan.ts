@@ -1,7 +1,9 @@
 // ABOUTME: planTransfer / planSpend (SPEC §4.6) — build inspectable Plan(s) for a shielded spend: single-tree
 // ABOUTME: TXO selection, change, broadcaster fee, circuit shape, and multi-group split. No proving; pure.
 
-import { getTokenDataERC20, getTokenDataHash } from '../core/index';
+import { getTokenDataERC20, getTokenDataHash, TransactNote } from '../core/index';
+import { Interface } from 'ethers';
+import type { TokenData } from '../core/index';
 import type { TXO } from '../sync/index';
 import {
   InsufficientBalanceError,
@@ -527,4 +529,93 @@ export function planWitnessInputs(plan: Plan): WitnessInput[] {
     }
     return { random: txo.random, value: txo.value, position: txo.position, merkleProofElements };
   });
+}
+
+// ============ planRagequit (C6) ============
+// The wallet's on-device ragequit planner (SPEC §4.6, C6): compute the `ShieldedRagequit.ragequit`
+// calldata and the expected on-chain CommitmentPreimage per asset, using exactly the contract's
+// payout bound: `armAmount * safe.balanceOf(token) / armToken.totalSupply()`.
+
+/** A `planRagequit` input (PlanTransferParams-style single object). */
+export interface PlanRagequitParams {
+  /** Units of the caller's ARM to burn. */
+  readonly armAmount: bigint;
+  /** The caller's note public key (`bytes32`); the payout note is created at this npk. */
+  readonly npk: `0x${string}`;
+  /** The treasury tokens that receive a pro-rata payout (ERC20 addresses). */
+  readonly tokens: readonly (`0x${string}`)[];
+  /** The Safe (treasury) balance per token, read from chain — keyed by token address. */
+  readonly safeBalances: Readonly<Record<`0x${string}`, bigint>>;
+  /** The ARM `totalSupply` (the bound's denominator). */
+  readonly armTotalSupply: bigint;
+  /** The deployed `ShieldedRagequit` address the calldata targets. */
+  readonly ragequitAddress: `0x${string}`;
+}
+
+/** One asset's expected payout note: the bound value and its on-chain preimage/commitment. */
+export interface RagequitAsset {
+  readonly tokenAddress: `0x${string}`;
+  /** The bounded payout: exactly `armAmount * safeBalance / armTotalSupply` (integer division). */
+  readonly payout: bigint;
+  /** The expected on-chain `preimageOf` entry: the caller's note at `npk` denominated in `token`. */
+  readonly expectedPreimage: {
+    readonly npk: `0x${string}`;
+    readonly token: TokenData;
+    readonly value: bigint;
+  };
+  /** The commitment leaf hash `Poseidon(npk, tokenHash, payout)` the pool records under `preimageOf`. */
+  readonly commitment: `0x${string}`;
+}
+
+/** The `planRagequit` result — the ragequit calldata plus each asset's expected preimage. */
+export interface PlanRagequitResult {
+  /** The calldata for `ShieldedRagequit.ragequit(armAmount, npk, tokens)`. */
+  readonly ragequitCalldata: {
+    readonly to: `0x${string}`;
+    readonly data: `0x${string}`;
+    readonly value: bigint;
+  };
+  readonly assets: RagequitAsset[];
+}
+
+// Shared ABI for the `ragequit` entry point.
+const RAGEQUIT_IFACE = new Interface(['function ragequit(uint256 armAmount, bytes32 npk, address[] tokens)']);
+
+/**
+ * Plan a shielded ragequit: compute the `ragequit` calldata and the expected on-chain
+ * `CommitmentPreimage` for each listed asset, using the same bound the contract enforces —
+ * `armAmount * safe.balanceOf(token) / armToken.totalSupply()`. The wallet shows the user the
+ * expected payout before they sign. Returns a plan-shaped result (a `Plan`-like object, C6 S1).
+ */
+export function planRagequit(params: PlanRagequitParams): PlanRagequitResult {
+  const { armAmount, npk, tokens, safeBalances, armTotalSupply, ragequitAddress } = params;
+  if (armTotalSupply <= 0n) {
+    throw new InvalidRequestError('planRagequit: armTotalSupply must be positive');
+  }
+  const data = RAGEQUIT_IFACE.encodeFunctionData('ragequit', [armAmount, npk, tokens]);
+
+  const assets: RagequitAsset[] = tokens.map((tokenAddress) => {
+    const safeBalance = safeBalances[tokenAddress] ?? 0n;
+    // Same bound the contract enforces: the integer-division pro-rata share.
+    const payout = (armAmount * safeBalance) / armTotalSupply;
+    const tokenData = getTokenDataERC20(tokenAddress);
+    const tokenHash = getTokenDataHash(tokenData);
+    const commitmentHash = TransactNote.getHash(BigInt(npk), tokenHash, payout);
+    const commitment = `0x${commitmentHash.toString(16).padStart(64, '0')}` as `0x${string}`;
+    return {
+      tokenAddress,
+      payout,
+      expectedPreimage: {
+        npk,
+        token: tokenData,
+        value: payout,
+      },
+      commitment,
+    };
+  });
+
+  return {
+    ragequitCalldata: { to: ragequitAddress, data: data as `0x${string}`, value: 0n },
+    assets,
+  };
 }
