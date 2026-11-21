@@ -1,0 +1,159 @@
+{
+  "id": "derived-ars-9d9",
+  "original_statement": "What must hold? State the invariant or expectation this concerns. exophial's docs/plans/nix-images.md decision D6 says a remote pre-commit hook repo becomes a repo: local, language: system hook, and the Nix image supplies its tool. Hook ids do not change.\nWhat holds now? Describe the current, observed state. .pre-commit-config.yaml has one repo: https://github.com/pre-commit/pre-commit-hooks block (rev v4.6.0) with 7 hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, mixed-line-ending. install-hooks needs network to fetch this repo.\nHow do you see it? Describe exactly how to observe this for yourself \u2014 the steps to reproduce, or how you would demo it. Run grep -n 'repo: http' .pre-commit-config.yaml. It prints the one remote repo line. Run pre-commit run --all-files --hook-stage manual and record the hook-id list before and after the change.\nWhat constraints apply? State them in plain prose. The set of 7 hook ids must not change. Each hook keeps its current args and file filters. The gate command in .exophial/config.yaml is unaffected. Only this one pre-commit repo block moves; the other local hooks are untouched.\nWhere does this apply? (e.g. gateway route, mobile screen, CLI verb) .pre-commit-config.yaml, the commit-boundary gate",
+  "restatement": "The pre-commit configuration must be changed so that the single remote hook repo block (github.com/pre-commit/pre-commit-hooks, rev v4.6.0, providing 7 hooks) is converted to a local, language: system hook block whose tool is supplied by the Nix image, per docs/plans/nix-images.md decision D6. The 7 hook ids (trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, mixed-line-ending) must remain exactly as they are, with unchanged args and file filters. No network access should be required to install hooks since the hooks no longer come from a remote repo. The gate command in .exophial/config.yaml and all other local hooks must remain untouched.",
+  "restatement_clauses": [
+    {
+      "id": "C1",
+      "text": "grep -n 'repo: http' .pre-commit-config.yaml must no longer print any line (the remote repo: https://github.com/pre-commit/pre-commit-hooks block is removed)."
+    },
+    {
+      "id": "C2",
+      "text": ".pre-commit-config.yaml must contain a repo: local block with language: system supplying the hook tool."
+    },
+    {
+      "id": "C3",
+      "text": "The set of 7 hook ids (trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, mixed-line-ending) must all still be present in .pre-commit-config.yaml."
+    },
+    {
+      "id": "C4",
+      "text": "Running pre-commit run --all-files --hook-stage manual must produce the same hook-id list before and after the change."
+    },
+    {
+      "id": "C5",
+      "text": "The gate command in .exophial/config.yaml must be unaffected (unchanged) by this change."
+    }
+  ],
+  "goal": "Make the project's commit-checks (like checking for trailing whitespace or large files) run using tools already bundled in the project's environment instead of being downloaded from the internet, without changing which checks run or how they behave.",
+  "acceptance_criteria": [
+    "Checking the .pre-commit-config.yaml file to confirm it no longer references any repository using an insecure 'http' link (as opposed to 'https').",
+    "Checks that the pre-commit configuration file includes a local repository block that uses the system language to supply the hook tool, by looking for 'repo: local' and 'language: system' entries in .pre-commit-config.yaml.",
+    "Checks that the configuration file .pre-commit-config.yaml still lists all seven expected hook names: trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, and mixed-line-ending.",
+    "When someone runs the full pre-commit check across all files including manual-stage hooks, the list of hook names that get executed should be identical to what it was before the change was made. Nothing should be silently added or removed from the set of checks that run.",
+    "Checks that the configuration file .exophial/config.yaml still contains the exact same 'gate' command entry it had before, with no modification to its wording or arguments."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "Checking the .pre-commit-config.yaml file to confirm it no longer references any repository using an insecure 'http' link (as opposed to 'https')."
+    },
+    {
+      "id": "c2",
+      "text": "Checks that the pre-commit configuration file includes a local repository block that uses the system language to supply the hook tool, by looking for 'repo: local' and 'language: system' entries in .pre-commit-config.yaml."
+    },
+    {
+      "id": "c3",
+      "text": "Checks that the configuration file .pre-commit-config.yaml still lists all seven expected hook names: trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, and mixed-line-ending."
+    },
+    {
+      "id": "c4",
+      "text": "When someone runs the full pre-commit check across all files including manual-stage hooks, the list of hook names that get executed should be identical to what it was before the change was made. Nothing should be silently added or removed from the set of checks that run."
+    },
+    {
+      "id": "c5",
+      "text": "Checks that the configuration file .exophial/config.yaml still contains the exact same 'gate' command entry it had before, with no modification to its wording or arguments."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "description": "Checking the .pre-commit-config.yaml file to confirm it no longer references any repository using an insecure 'http' link (as opposed to 'https').",
+      "files": [
+        ".pre-commit-config.yaml"
+      ],
+      "pattern": "repo: http[^s]",
+      "proves": "The pre-commit-hooks remote block using an insecure 'repo: http' URL has been removed from .pre-commit-config.yaml.",
+      "restatement_clause_id": "C1",
+      "type": "grep_absent",
+      "clause_id": "c1"
+    },
+    {
+      "additional_patterns": [
+        "language:\\s*system"
+      ],
+      "count": {
+        "op": "ge",
+        "unit": "patterns",
+        "value": 2
+      },
+      "description": "Checks that the pre-commit configuration file includes a local repository block that uses the system language to supply the hook tool, by looking for 'repo: local' and 'language: system' entries in .pre-commit-config.yaml.",
+      "files": [
+        ".pre-commit-config.yaml"
+      ],
+      "pattern": "repo:\\s*local",
+      "proves": "The text 'repo: local' and 'language: system' appear in .pre-commit-config.yaml, matching the wording required for a local hook configuration.",
+      "restatement_clause_id": "C2",
+      "type": "grep",
+      "clause_id": "c2"
+    },
+    {
+      "additional_patterns": [
+        "id:\\s*end-of-file-fixer",
+        "id:\\s*check-yaml",
+        "id:\\s*check-added-large-files",
+        "id:\\s*check-merge-conflict",
+        "id:\\s*check-case-conflict",
+        "id:\\s*mixed-line-ending"
+      ],
+      "count": {
+        "op": "eq",
+        "unit": "patterns",
+        "value": 7
+      },
+      "description": "Checks that the configuration file .pre-commit-config.yaml still lists all seven expected hook names: trailing-whitespace, end-of-file-fixer, check-yaml, check-added-large-files, check-merge-conflict, check-case-conflict, and mixed-line-ending.",
+      "files": [
+        ".pre-commit-config.yaml"
+      ],
+      "pattern": "id:\\s*trailing-whitespace",
+      "proves": "That the text of each of the seven required hook ids still appears somewhere in .pre-commit-config.yaml, showing none of them were removed from the file's wording.",
+      "restatement_clause_id": "C3",
+      "type": "grep",
+      "clause_id": "c3"
+    },
+    {
+      "description": "When someone runs the full pre-commit check across all files including manual-stage hooks, the list of hook names that get executed should be identical to what it was before the change was made. Nothing should be silently added or removed from the set of checks that run.",
+      "max_runs": 1,
+      "proves": "Confirms the change did not alter which pre-commit hooks are configured to run under --all-files --hook-stage manual, by comparing the hook-id list output before and after against a stored baseline.",
+      "restatement_clause_id": "C4",
+      "then": [
+        {
+          "field": "hooks_match_baseline",
+          "observe": "stdout_json",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "field": "exit_code",
+          "observe": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "timeout_seconds": 120,
+      "type": "behavior",
+      "when": {
+        "args": [
+          "--baseline",
+          "scripts/precommit_baseline_hooks.json"
+        ],
+        "interpreter": "python3",
+        "script": "scripts/check_precommit_hooks.py",
+        "stdin": ""
+      },
+      "clause_id": "c4"
+    },
+    {
+      "description": "Checks that the configuration file .exophial/config.yaml still contains the exact same 'gate' command entry it had before, with no modification to its wording or arguments.",
+      "files": [
+        ".exophial/config.yaml"
+      ],
+      "pattern": "^\\s*gate:\\s*.+$",
+      "proves": "That the gate command text in .exophial/config.yaml is present and unchanged from its expected form, as evidenced by the exact wording still appearing in the file.",
+      "restatement_clause_id": "C5",
+      "type": "grep",
+      "clause_id": "c5"
+    }
+  ],
+  "declared_new_entrypoints": [
+    "scripts/check_precommit_hooks.py"
+  ]
+}
