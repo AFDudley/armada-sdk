@@ -33,7 +33,16 @@ RUN curl -fsSL https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz \
     && npm install -g npm@11.16.0
 
 # --- pre-commit 4.5.1 (the host's version) ---
-RUN uv tool install pre-commit==4.5.1
+# --- pre-commit-hooks 4.6.0 (D6, docs/plans/nix-images.md): the former
+#     `repo: https://github.com/pre-commit/pre-commit-hooks` block in
+#     .pre-commit-config.yaml is now `repo: local`/`language: system`,
+#     naming these console scripts (trailing-whitespace-fixer,
+#     end-of-file-fixer, check-yaml, check-added-large-files,
+#     check-merge-conflict, check-case-conflict, mixed-line-ending)
+#     directly -- `uv tool install` exposes every console_script the
+#     package declares, same pattern as exophial-check-claude-md above.
+RUN uv tool install pre-commit==4.5.1 \
+    && uv tool install pre-commit-hooks==4.6.0
 
 WORKDIR /gate
 COPY . .

@@ -121,20 +121,54 @@ repos:
         language: system
         stages: [commit-msg]
 
-  # === Base hooks ===
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+  # === Base hooks (D6, docs/plans/nix-images.md): vendored locally instead of
+  # fetched from https://github.com/pre-commit/pre-commit-hooks at install
+  # time. The 7 hook ids, their args, and their file-type filters (`types:`)
+  # are copied verbatim from that repo's .pre-commit-hooks.yaml at the rev
+  # this previously pinned (v4.6.0); only `entry`/`language` change, from a
+  # fetched Python venv to the `pre-commit-hooks==4.6.0` console scripts the
+  # Nix/Docker image now bundles on PATH (.exophial/gate/Dockerfile).
+  - repo: local
     hooks:
       - id: trailing-whitespace
+        name: trim trailing whitespace
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
         args: [--markdown-linebreak-ext=md]
       - id: end-of-file-fixer
+        name: fix end of files
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
       - id: check-yaml
+        name: check yaml
+        entry: check-yaml
+        language: system
+        types: [yaml]
         args: [--unsafe]
       - id: check-added-large-files
+        name: check for added large files
+        entry: check-added-large-files
+        language: system
+        stages: [pre-commit, pre-push, manual]
         args: [--maxkb=1000]
       - id: check-merge-conflict
+        name: check for merge conflicts
+        entry: check-merge-conflict
+        language: system
+        types: [text]
       - id: check-case-conflict
+        name: check for case conflicts
+        entry: check-case-conflict
+        language: system
       - id: mixed-line-ending
+        name: mixed line ending
+        entry: mixed-line-ending
+        language: system
+        types: [text]
         args: [--fix=lf]
 
   # === JavaScript/TypeScript: ESLint ===
