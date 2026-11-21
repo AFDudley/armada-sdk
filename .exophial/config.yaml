@@ -2,6 +2,14 @@ coordination_repo: "/home/rix/code/git_puller/repos/armada-sdk"
 poll_interval: 5
 inspect_interval: 5
 
+# The omp worker in a container takes its Anthropic token only from this command
+# (DispatcherConfig.credential_command). Without it no /credential is mounted and
+# the worker exits "omp worker needs an Anthropic credential". Host-local
+# override, added 2026-11-21: the container-spawned worker for ars-9d9 failed
+# with exactly this cause before this line existed.
+credential:
+  command: ["omp", "token", "anthropic"]
+
 dispatcher:
   backend: omp
   max_workers: 1
@@ -33,8 +41,8 @@ spec_dir: "contracts/specs"
 # high-criticality (critical/catastrophic) filings route to `frontier`.
 intake_derivation:
   tiers:
-    small: "sonnet"
-    frontier: "opus"
+    small: "claude-sonnet-5"
+    frontier: "claude-opus-5"
   thinking_budgets:
     small: 4000
     frontier: 31999
@@ -61,6 +69,10 @@ worker_model:
   tiers:
     default: "pool/5090"
     frontier: "claude-opus-5"
+    # Added 2026-11-21 (operator ruling, nix-images.md Milestone 3): `default`
+    # routes to the local GPU pool. The flake-gate migration pebbles use this
+    # tier instead, so they run on Sonnet without changing `default`.
+    migration-sonnet: "anthropic/claude-sonnet-5"
   routing:
     default: default
 
