@@ -27,6 +27,12 @@ dispatcher:
 gate:
   command: ["bash", "-c", "npm ci --offline --no-audit --no-fund && pre-commit run --all-files && npm run lint && npm run typecheck && npm run typecheck:vendor && npm run build && npm test && (grep -rn 'POI' src/ vendor/ | grep -v 'POINTS' && exit 1 || true) && node scripts/check-vendor-divergence.mjs"]
   timeout: 150
+  # D7: the root flake (flake.nix/flake.lock, nix/*) builds the
+  # commit-boundary gate image instead of .exophial/gate/Dockerfile.
+  # Parity measured 2026-11-22: the unmodified gate.command above exits
+  # 0 in both the flake image and the Dockerfile image, on the same
+  # tree.
+  image: flake
 
 # Where `exophial spec generate` writes unified spec instances (repo-relative).
 spec_dir: "contracts/specs"
